@@ -1,0 +1,1126 @@
+import asyncio
+import re
+import aiohttp
+from bs4 import BeautifulSoup
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
+from dotenv import load_dotenv
+import datetime
+import json
+import os
+import logging
+import pickle
+import time  # used for cache timestamps
+from collections import OrderedDict  # added for LRU locks
+#Асинхронные запросы asyncio
+#Кеширование загруженных страниц
+#Автоопределение текущей учебной недели
+#Сохранение кеша и данных в файл
+#Защита от message too big
+#Хендлер пересылки и возможность отправки сообщений юзерам
+
+# ----------------- CONFIG -----------------
+load_dotenv("/root/TGBOT/.env") # файл .env с записанным токеном, путь к файлу
+TOKEN = os.getenv("RELEASE_TOKEN") # внутри .env RELEASE_TOKEN=токен бота
+BASE_URL = "https://lk.ks.psuti.ru/?mn=2&obj=218"
+BOT_OWNER_ID = int(os.getenv("OWNERID")) #ID ТГ Аккаунта
+USER_FILE = "users.json" #Куда сохраняются пользователи
+GROUPS_FILE = "groups.json" #Где хранится список групп + курсы
+SELECTION_FILE = "selections.json" #Закешированный выбор юзеров
+CURRENT_WK_CACHE: dict = {"wk": 323, "ts": 0.0}
+
+# CACHE config
+CACHE_TTL_SECONDS = 300  # TTL Кеша
+CACHE_FILE = "page_cache.pkl"  # Бэкап
+FETCH_SEMAPHORE_LIMIT = 10
+MAX_CACHE_AGE_DAYS = 1 #Время хранения кеша в бекапе
+
+# LOCKS LRU config
+LOCKS_CACHE_MAX = 1000  # URL локи
+
+# ----------------- LOGGING -----------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ----------------- STATE -----------------
+bot = Bot(TOKEN)
+dp = Dispatcher()
+
+class UserActivityMiddleware:
+    async def __call__(self, handler, event, data):
+        # event может быть Message или CallbackQuery
+        if hasattr(event, "from_user") and event.from_user is not None:
+            update_user_activity(
+                event.from_user.id,
+                event.from_user.username
+            )
+        return await handler(event, data)
+
+dp.message.middleware(UserActivityMiddleware())
+dp.callback_query.middleware(UserActivityMiddleware())
+
+current_wk_per_chat: dict[int, int] = {}
+last_msg_per_chat: dict[int, int] = {}
+last_text_per_chat: dict[int, str] = {}
+
+locks: dict[int, asyncio.Lock] = {}
+
+selected_course_per_chat: dict[int, str] = {}
+selected_group_per_chat: dict[int, str] = {}
+
+waiting_for_schedule_time: set[int] = set()
+last_sent_today: dict[int, str] = {}
+
+# Global aiohttp session (new)
+_shared_session: aiohttp.ClientSession | None = None
+
+# ----------------- STORAGE -----------------
+def load_json_file(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_json_file(path: str, data: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_users():
+    """Загружает всех пользователей из файла целиком"""
+    try:
+        raw = load_json_file(USER_FILE)
+        # Убеждаемся, что все ключи — строки для консистентности JSON
+        return {str(k): v for k, v in raw.items()}
+    except Exception as e:
+        logger.error(f"Ошибка загрузки пользователей: {e}")
+        return {}
+
+def save_users(users):
+    """Сохраняет весь словарь пользователей в файл без потерь данных"""
+    try:
+        save_json_file(USER_FILE, users)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения пользователей: {e}")
+
+# Инициализация хранилища
+user_store = load_users()
+user_store = {str(k): v for k, v in user_store.items()}
+
+def update_user_activity(user_id: int, username: str | None):
+    uid = str(user_id)
+
+    if uid not in user_store:
+        user_store[uid] = {}
+
+    # Обновляем только конкретные поля, не трогая schedule_time
+    user_store[uid]["username"] = username or user_store[uid].get("username", "без ника")
+    user_store[uid]["last_activity"] = time.time()
+
+    save_users(user_store)
+
+def add_user(uid, username):
+    if uid not in user_store:
+        user_store[uid] = username or "без ника"
+        save_users(user_store)
+
+def register_user_from_message(msg):
+    try:
+        user = msg.from_user
+        update_user_activity(user.id, user.username)
+    except:
+        pass
+
+groups: dict[str, dict] = load_json_file(GROUPS_FILE)
+
+# ----------------- SELECTION STORAGE -----------------
+def load_selections():
+    global selected_course_per_chat, selected_group_per_chat
+    data = load_json_file(SELECTION_FILE)
+
+    selected_course_per_chat = {
+        int(k): v for k, v in data.get("course", {}).items()
+    }
+
+    selected_group_per_chat = {
+        int(k): v for k, v in data.get("group", {}).items()
+    }
+
+def save_selections():
+    data = {
+        "course": {str(k): v for k, v in selected_course_per_chat.items()},
+        "group": {str(k): v for k, v in selected_group_per_chat.items()},
+    }
+    save_json_file(SELECTION_FILE, data)
+
+if os.path.exists(SELECTION_FILE):
+    load_selections()
+
+# ----------------- HELPERS -----------------
+def courses_list():
+    vals = {str(info.get("course", "")) for info in groups.values()}
+    return sorted(v for v in vals if v)
+
+def groups_for_course(course):
+    return sorted(name for name, info in groups.items() if str(info.get("course")) == str(course))
+
+def build_url_for_wk(wk: int | None, chat_id: int) -> str:
+    """Формирует URL с учётом выбранной группы и недели"""
+    base = BASE_URL
+
+    grp = selected_group_per_chat.get(chat_id)
+    if grp and grp in groups:
+        base = f"https://lk.ks.psuti.ru/?mn=2&obj={groups[grp]['obj']}"
+
+    if wk is None:
+        return base  # без wk — сайт сам покажет текущую
+
+    return f"{base}&wk={wk}"
+
+# ----------------- INLINE KEYBOARDS -----------------
+def make_inline_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+		InlineKeyboardButton(text="📆 сегодня", callback_data="day_today"),
+                InlineKeyboardButton(text="🔁 обновить", callback_data="wk_refresh")
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ предыдущая", callback_data="wk_prev"),
+		InlineKeyboardButton(text="📅 эта неделя", callback_data="wk_this"),
+                InlineKeyboardButton(text="➡️ следующая", callback_data="wk_next")
+            ],
+            [
+		InlineKeyboardButton(text="📨 рассылка", callback_data="setup_schedule"),
+                InlineKeyboardButton(text="⚙️ сменить группу", callback_data="change_group")
+            ]
+        ]
+    )
+
+def build_courses_kb():
+    rows = []
+
+    for c in courses_list():
+        rows.append([
+            InlineKeyboardButton(text=f"{c} курс", callback_data=f"course_{c}")
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def build_groups_kb(groups_list):
+    rows = []
+    row = []
+
+    for g in groups_list:
+        row.append(
+            InlineKeyboardButton(text=g, callback_data=f"group_{g}")
+        )
+
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# ----------------- HTML PARSER -------------------------
+def parse_schedule_pretty(html: str) -> str:
+    if not html:
+        return "⚠️ Расписание не загрузилось (пустая страница)"
+
+    soup = BeautifulSoup(html, "html.parser")
+    IGNORE_PHRASES = {"предыдущая неделя", "выберите группу", "первый курс"}
+
+    result = []
+    last_block = None
+
+    trs = list(soup.find_all("tr"))
+    for tr in trs:
+        h3 = tr.find("h3")
+        if h3:
+            day = " ".join(h3.get_text(" ", strip=True).split())
+            if not day:
+                continue
+            lowday = day.lower()
+            if any(p in lowday for p in IGNORE_PHRASES):
+                continue
+            header = f"\n📅 <b>{day}</b>\n"
+            if header != last_block:
+                result.append(header)
+                last_block = header
+
+        tds = tr.find_all("td")
+        if len(tds) >= 4:
+            num = tds[0].get_text(strip=True)
+            if not num.isdigit():
+                continue
+
+            time_lines = [x.strip() for x in tds[1].stripped_strings]
+            time = time_lines[0] if time_lines else ""
+            transfer = ""
+            for t in time_lines[1:]:
+                if "перенос" in t.lower():
+                    transfer = t
+
+            cell = tds[3]
+            lines = [x.strip() for x in cell.stripped_strings if x.strip()]
+            if not lines:
+                continue
+
+            # ФИКС ЗАМЕН
+            clean_lines = []
+            for l in lines:
+                low = l.lower()
+                if low == "на:":
+                    clean_lines = []
+                    continue
+                if low == "замена":
+                    continue
+                clean_lines.append(l)
+
+            subject = clean_lines[0] if clean_lines else ""
+            teacher = ""
+            if len(clean_lines) > 1:
+                t = clean_lines[1]
+                teacher = t[1:-1] if t.startswith("(") and t.endswith(")") else t
+
+            address = ""
+            room = ""
+            for l in clean_lines[2:]:
+                low = l.lower()
+                if "каб" in low or "ауд" in low:
+                    room = l
+                elif any(c.isdigit() for c in l) and ("ул" in low or "шоссе" in low):
+                    address = l
+
+            pair = f"▫️ <b>{num}</b> | {time}"
+            if transfer:
+                pair += f" {transfer}"
+            pair += "\n"
+
+            if subject:
+                if subject.lower() == "свободное время":
+                    pair += f"   💤 {subject}\n"
+                else:
+                    pair += f"   📚 {subject}\n"
+
+            if teacher and subject.lower() != "свободное время":
+                pair += f"   👤 {teacher}\n"
+            if address:
+                pair += f"   🏢 {address}\n"
+            if room:
+                pair += f"   🚪 {room}\n"
+
+            if pair != last_block:
+                result.append(pair)
+                last_block = pair
+
+    cleaned = []
+    for line in result:
+        if cleaned and cleaned[-1].strip() == line.strip():
+            continue
+        cleaned.append(line)
+
+    text = "\n".join(cleaned).strip()
+
+    # === ЗАЩИТА ОТ ПУСТОГО РАСПИСАНИЯ ===
+    if not text:
+        return "⚠️ Расписание пустое или не найдено на эту неделю.\nПопробуйте кнопку «🔁 обновить»"
+
+    return text
+
+def extract_today(schedule_text: str) -> str:
+
+    days = [
+        "понедельник",
+        "вторник",
+        "среда",
+        "четверг",
+        "пятница",
+        "суббота",
+        "воскресенье"
+    ]
+
+    today = days[datetime.datetime.now().weekday()]
+
+    blocks = schedule_text.split("📅")
+
+    for block in blocks:
+        if today in block.lower():
+            return "📅 " + block.strip()
+
+    return "Сегодня занятий нет"
+
+def has_classes_today(week_text: str) -> bool:
+    """Проверяет, есть ли сегодня пары (не пустой ли текст для текущего дня)"""
+    today_text = extract_today(week_text)
+    # Если в тексте только название дня недели и нет слов 'пара' или времени
+    if len(today_text.strip()) < 30 or "Пары на сегодня не найдены" in today_text:
+        return False
+    return True
+
+async def schedule_sender():
+    while True:
+        try:
+            now_dt = datetime.datetime.now()
+            now_str = now_dt.strftime("%H:%M")
+            today_iso = datetime.date.today().isoformat()
+
+            for uid_str, info in user_store.items():
+                target_time = info.get("schedule_time")
+                
+                if target_time == now_str:
+                    # Проверяем, не отправляли ли уже сегодня
+                    if info.get("last_sent_date") == today_iso:
+                        continue
+                    
+                    uid_int = int(uid_str)
+                    
+                    # Проверяем, выбрана ли группа
+                    if uid_int not in selected_group_per_chat:
+                        continue
+
+                    wk = await get_current_wk()
+                    url = build_url_for_wk(wk, uid_int)
+                    
+                    async with _shared_session.get(url) as resp:
+                        html = await resp.text()
+                    
+                    week_text = parse_schedule_pretty(html)
+
+                    # Отправляем только если есть пары
+                    if has_classes_today(week_text):
+                        today_text = extract_today(week_text)
+                        group = selected_group_per_chat.get(uid_int, "не выбрана")
+                        await bot.send_message(
+                            uid_int, 
+                            f"👤 <b>Ваша группа:</b> {group}\n🔔 <b>Ваше расписание на сегодня:</b>\n\n{today_text}",
+                            parse_mode=ParseMode.HTML
+                        )
+                    
+                    # Помечаем как отправленное (даже если пар нет, чтобы не проверять каждую секунду)
+                    user_store[uid_str]["last_sent_date"] = today_iso
+                    save_users(user_store)
+
+        except Exception as e:
+            logging.error(f"Ошибка в цикле рассылки: {e}")
+
+        # Спим до начала следующей минуты
+        await asyncio.sleep(60 - datetime.datetime.now().second)
+
+# ----------------- FETCH (basic) -----------------
+async def fetch_page_once(session, url):
+    try:
+        async with session.get(url, timeout=10) as r:
+            return await r.text()
+    except Exception as e:
+        logger.debug("fetch_page_once error for %s: %s", url, e)
+        return ""
+
+# ----------------- CACHE -----------------
+_cache: dict[str, tuple[float, str]] = {}
+_locks_per_url: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
+_fetch_semaphore = asyncio.Semaphore(FETCH_SEMAPHORE_LIMIT)
+
+def _clean_old_cache():
+    """Удаляет из кэша записи, которые старше MAX_CACHE_AGE_DAYS."""
+    global _cache
+    now = time.time()
+    max_age_seconds = MAX_CACHE_AGE_DAYS * 24 * 3600
+
+    initial_size = len(_cache)
+    # Фильтруем словарь: оставляем только свежие записи
+    _cache = {
+        url: data for url, data in _cache.items()
+        if (now - data[0]) < max_age_seconds
+    }
+
+    if len(_cache) < initial_size:
+        logger.info("♻️ Кэш очищен: удалено %d старых записей", initial_size - len(_cache))
+
+def _load_cache_file():
+    if not os.path.exists(CACHE_FILE):
+        return
+    try:
+        with open(CACHE_FILE, "rb") as f:
+            data = pickle.load(f)
+            if isinstance(data, dict):
+                _cache.update(data)
+                logger.info("Loaded cache file with %d entries", len(data))
+    except Exception as e:
+        logger.warning("Failed to load cache file: %s", e)
+
+def _save_cache_file():
+    try:
+        _clean_old_cache()  # Чистим перед сохранением
+
+        with open(CACHE_FILE + ".tmp", "wb") as f:
+            pickle.dump(_cache, f)
+        os.replace(CACHE_FILE + ".tmp", CACHE_FILE)
+        logger.info("Saved cache file (%d entries)", len(_cache))
+    except Exception as e:
+        logger.warning("Failed to save cache file: %s", e)
+
+# попытка загрузки кеша при старте
+_load_cache_file()
+
+# ----------------- АВТООПРЕДЕЛЕНИЕ НЕДЕЛИ -----------------
+async def get_current_wk() -> int:
+    """Автоматически определяет текущую неделю с сайта (кэш 24 часа)"""
+    global CURRENT_WK_CACHE
+    now = time.time()
+
+    # Возвращаем кэш, если он свежий
+    if now - CURRENT_WK_CACHE["ts"] < 86400:  # 24 часа
+        return CURRENT_WK_CACHE["wk"]
+
+    # Обновляем через любую группу (ИСПП-34)
+    url = "https://lk.ks.psuti.ru/?mn=2&obj=218"
+    html = await get_cached_page(_shared_session, url)
+
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        # Ищем ссылку "следующая неделя"
+        next_link = soup.find("a", string=lambda text: text and "следующая неделя" in text.lower())
+        if next_link and "wk=" in next_link.get("href", ""):
+            try:
+                next_wk = int(next_link["href"].split("wk=")[-1].split("&")[0])
+                wk = next_wk - 1
+                CURRENT_WK_CACHE = {"wk": wk, "ts": now}
+                logger.info(f"🔄 Определена текущая неделя: {wk}")
+                return wk
+            except:
+                pass
+
+    # Fallback на последний известный
+    logger.warning("Не удалось определить wk, используем кэш")
+    return CURRENT_WK_CACHE["wk"]
+
+def _get_lock_for_url(url: str) -> asyncio.Lock:
+    """
+    Return a lock for the URL, using an LRU-limited OrderedDict to avoid unbounded growth.
+    Evict oldest entries when exceeding LOCKS_CACHE_MAX.
+    """
+    lock = _locks_per_url.pop(url, None)
+    if lock:
+        # степа лох
+        _locks_per_url[url] = lock
+        return lock
+    lock = asyncio.Lock()
+    _locks_per_url[url] = lock
+    if len(_locks_per_url) > LOCKS_CACHE_MAX:
+        try:
+            _locks_per_url.popitem(last=False)
+        except Exception:
+            pass
+    return lock
+
+async def get_cached_page(session, url):
+    now = time.time()
+    cached = _cache.get(url)
+    if cached:
+        ts, val = cached
+        if now - ts < CACHE_TTL_SECONDS:
+            return val
+
+    lock = _get_lock_for_url(url)
+
+    async with lock:
+        cached = _cache.get(url)
+        if cached:
+            ts, val = cached
+            if now - ts < CACHE_TTL_SECONDS:
+                return val
+
+        async with _fetch_semaphore:
+            delay = 0.5
+            for attempt in range(3):
+                html = await fetch_page_once(session, url)
+                if html:
+                    _cache[url] = (time.time(), html)
+                    if len(_cache) % 50 == 0:
+                        _save_cache_file()
+                    return html
+                await asyncio.sleep(delay)
+                delay *= 2
+
+        _cache[url] = (time.time(), "")
+        return ""
+
+# ----------------- SEND MESSAGE / EDIT -----------------
+async def send_or_edit_text(text, chat_id, reply_message=None):
+    if not text or not text.strip():
+        text = "⚠️ Расписание не загрузилось. Нажмите «🔁 обновить»"
+
+    last_id = last_msg_per_chat.get(chat_id)
+    last_text = last_text_per_chat.get(chat_id)
+
+    MAX_LEN = 4000
+
+    if len(text) > MAX_LEN:
+        parts = []
+
+        current = ""
+        for line in text.split("\n"):
+            if len(current) + len(line) + 1 > MAX_LEN:
+                parts.append(current)
+                current = line
+            else:
+                current += "\n" + line if current else line
+
+        if current:
+            parts.append(current)
+
+        for part in parts:
+            await bot.send_message(
+                chat_id,
+                part,
+                parse_mode=ParseMode.HTML,
+                reply_markup=make_inline_kb()
+            )
+
+        return
+
+    if last_text is not None and text == last_text:
+        if last_id:
+            try:
+                await bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=last_id,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=make_inline_kb()
+                )
+            except TelegramBadRequest as e:
+                err = str(e).lower()
+                if "message is not modified" in err or "specified new message content is the same as the current content" in err:
+                    return
+                logger.debug("edit_message_text TelegramBadRequest for %s: %s", chat_id, e)
+                last_msg_per_chat.pop(chat_id, None)
+            except Exception as e:
+                logger.debug("edit_message_text unexpected error: %s", e)
+                last_msg_per_chat.pop(chat_id, None)
+        else:
+            return
+    else:
+        if last_id:
+            try:
+                await bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=last_id,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=make_inline_kb()
+                )
+                last_text_per_chat[chat_id] = text
+                return
+            except TelegramBadRequest as e:
+                err = str(e).lower()
+                if "message is not modified" in err or "specified new message content is the same as the current content" in err:
+                    last_text_per_chat[chat_id] = text
+                    return
+                logger.debug("edit_message_text TelegramBadRequest for %s: %s", chat_id, e)
+                last_msg_per_chat.pop(chat_id, None)
+            except Exception as e:
+                logger.debug("edit_message_text unexpected error: %s", e)
+                last_msg_per_chat.pop(chat_id, None)
+
+    msg = await bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_inline_kb()
+    )
+    last_msg_per_chat[chat_id] = msg.message_id
+    last_text_per_chat[chat_id] = text
+
+# ----------------- SHOW WEEK -----------------
+async def handle_show_week(message, wk, reply_message):
+
+    chat_id = message.chat.id
+
+    global _shared_session
+    session = _shared_session
+    if session is None:
+        async with aiohttp.ClientSession() as tmp_s:
+            html = await get_cached_page(tmp_s, build_url_for_wk(wk, chat_id))
+    else:
+        html = await get_cached_page(session, build_url_for_wk(wk, chat_id))
+
+    text = parse_schedule_pretty(html)
+
+    group = selected_group_per_chat.get(chat_id, "не выбрана")
+    text = f"👤 <b>Ваша группа:</b> {group}\n\n{text}"
+
+    await send_or_edit_text(text, chat_id)
+
+# ----------------- START -----------------
+@dp.message(Command("start"))
+async def start(message: Message):
+    register_user_from_message(message)
+    update_user_activity(message.from_user.id, message.from_user.username)
+
+    await bot.send_message(
+        message.chat.id,
+        "йоу собаки я наруто узумаки", #приветственное сообщение
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_inline_kb()
+    )
+# ----------------- GROUP MENU -----------------
+@dp.callback_query(F.data == "change_group")
+async def change_group(cb: CallbackQuery):
+
+    await cb.answer()
+    update_user_activity(cb.from_user.id, cb.from_user.username)
+
+    try:
+        msg = await bot.send_message(
+            cb.message.chat.id,
+            "Выберите курс",
+            reply_markup=build_courses_kb()
+        )
+        last_msg_per_chat[cb.message.chat.id] = msg.message_id
+        last_text_per_chat[cb.message.chat.id] = "Выберите курс"
+    except Exception:
+        await send_or_edit_text("Выберите курс", cb.message.chat.id)
+
+@dp.callback_query(F.data.startswith("course_"))
+async def select_course(cb: CallbackQuery):
+
+    await cb.answer()
+    update_user_activity(cb.from_user.id, cb.from_user.username)
+
+    course = cb.data.split("_")[1]
+
+    selected_course_per_chat[cb.message.chat.id] = course
+    save_selections()
+
+    grs = groups_for_course(course)
+
+    try:
+        text = f"Курс {course}\n\nВыберите группу"
+        msg = await bot.send_message(
+            cb.message.chat.id,
+            text,
+            reply_markup=build_groups_kb(grs)
+        )
+        last_msg_per_chat[cb.message.chat.id] = msg.message_id
+        last_text_per_chat[cb.message.chat.id] = text
+    except Exception:
+        await send_or_edit_text(f"Курс {course}\n\nВыберите группу", cb.message.chat.id)
+
+@dp.callback_query(F.data.startswith("group_"))
+async def select_group(cb: CallbackQuery):
+
+    await cb.answer()
+    update_user_activity(cb.from_user.id, cb.from_user.username)
+
+    group = cb.data.split("_", 1)[1]
+
+    selected_group_per_chat[cb.message.chat.id] = group
+    save_selections()
+
+    chat_id = cb.message.chat.id
+
+    await send_or_edit_text(
+        f"Группа выбрана: {group}\n\n⏳ Загружаю расписание...",
+        chat_id
+    )
+
+    wk = await get_current_wk()
+    current_wk_per_chat[chat_id] = wk
+
+    await handle_show_week(cb.message, wk, cb.message)
+
+# ----------------- WEEK BUTTONS -----------------
+@dp.callback_query(F.data.startswith("wk_"))
+async def week_buttons(cb: CallbackQuery):
+
+    await cb.answer()
+
+    # === ОБНОВЛЕНИЕ АКТИВНОСТИ И USERNAME (исправлено) ===
+    update_user_activity(cb.from_user.id, cb.from_user.username)
+
+    # === ЛОГИКА КНОПОК === (всё остальное без изменений)
+    if cb.data == "wk_this":
+        wk = await get_current_wk()
+
+    elif cb.data == "wk_refresh":
+        wk = current_wk_per_chat.get(cb.message.chat.id, await get_current_wk())
+
+        last_msg_per_chat.pop(cb.message.chat.id, None)
+        last_text_per_chat.pop(cb.message.chat.id, None)
+
+    else:
+        # prev / next
+        wk = current_wk_per_chat.get(cb.message.chat.id, await get_current_wk())
+
+        if cb.data == "wk_prev":
+            wk -= 1
+        elif cb.data == "wk_next":
+            wk += 1
+
+    # сохраняем выбранную неделю
+    current_wk_per_chat[cb.message.chat.id] = wk
+
+    await handle_show_week(cb.message, wk, cb.message)
+
+@dp.callback_query(F.data == "day_today")
+async def show_today(cb: CallbackQuery):
+    await cb.answer()
+
+    wk = await get_current_wk()
+    
+    current_wk_per_chat[cb.message.chat.id] = wk
+
+    global _shared_session
+    html = await get_cached_page(_shared_session, build_url_for_wk(wk, cb.message.chat.id))
+
+    week_text = parse_schedule_pretty(html)
+
+    today_text = extract_today(week_text)
+
+    group = selected_group_per_chat.get(cb.message.chat.id, "не выбрана")
+    today_text = f"👤 <b>Ваша группа:</b> {group}\n\n{today_text}"
+
+    await send_or_edit_text(today_text, cb.message.chat.id)
+
+waiting_for_schedule_time = set()
+
+@dp.callback_query(F.data == "setup_schedule")
+async def ask_schedule_time(cb: CallbackQuery):
+    await cb.answer()
+    chat_id = cb.message.chat.id
+    uid = str(cb.from_user.id)
+    
+    current_time = "не установлена"
+    if uid in user_store and "schedule_time" in user_store[uid]:
+        current_time = user_store[uid]["schedule_time"]
+
+    waiting_for_schedule_time.add(chat_id)
+    
+    text = (
+        f"⏰ <b>Настройка рассылки</b>\n\n"
+        f"Сейчас рассылка: <b>{current_time}</b>\n\n"
+        f"Введите время в формате <b>ЧЧ:ММ</b> (например, 08:30).\n"
+        f"Бот будет присылать расписание только в учебные дни.\n\n"
+        f"Чтобы отключить, напишите: <code>Отменить рассылку</code>\n\n"
+        f"ВАЖНО: Бот будет отправлять расписание той группы. Которая была вами выбрана на момент отправки.\n\n"
+        f"ВАЖНО: Во избежание спама бот может отправлять рассылку лишь 1 раз в день!\n"
+    )
+    await cb.message.answer(text, parse_mode=ParseMode.HTML)
+
+# ----------------- TRIGGER COMMANDS -----------------
+@dp.message(Command("list_users"))
+async def list_users(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        return
+    if not user_store:
+        await message.answer("Пользователи ещё не зарегистрированы")
+        return
+
+    lines = []
+    for uid, info in sorted(user_store.items(), key=lambda x: int(x[0])):
+        ts = info.get("last_activity", 0)
+        if ts > 0:
+            dt = datetime.datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M:%S")
+            last_seen = f" (последняя активность: {dt})"
+        else:
+            last_seen = " (активность неизвестна)"
+        lines.append(f"{uid} — @{info.get('username', 'без ника')}{last_seen}")
+
+    await message.answer("📋 Сохранённые пользователи:\n\n" + "\n".join(lines))
+
+# словарь: user_id -> target_id (кому пересылать)
+active_trolls: dict[int, int] = {}
+
+@dp.message(Command("broadcast"))
+async def broadcast(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        return
+
+    if not message.reply_to_message:
+        await message.answer("Сделайте reply на сообщение для рассылки.")
+        return
+
+    msg = message.reply_to_message
+
+    sent = 0
+    failed = 0
+
+    for uid in user_store:
+        user_id = int(uid)
+
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=msg.chat.id,
+                message_id=msg.message_id
+            )
+
+            sent += 1
+            await asyncio.sleep(0.05)
+
+        except Exception:
+            failed += 1
+
+    await message.answer(
+        f"📢 Рассылка завершена\n\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}"
+    )
+
+@dp.message(Command("troll_to"))
+async def start_troll(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        return
+
+    target_id = None
+
+    # если команда ответом на сообщение
+    if message.reply_to_message:
+        text = message.reply_to_message.text or ""
+
+        match = re.search(r"\((\d+)\)", text)
+        if match:
+            target_id = int(match.group(1))
+        else:
+            target_id = message.reply_to_message.from_user.id
+
+    else:
+        args = message.text.split(maxsplit=1)
+
+        if len(args) < 2:
+            await message.answer("Использование: /troll_to user_id")
+            return
+
+        try:
+            target_id = int(args[1].strip())
+        except ValueError:
+            await message.answer("Неверный user_id")
+            return
+
+    target_id = str(target_id)
+
+    if target_id not in user_store:
+        await message.answer("Такого пользователя нет")
+        return
+
+    active_trolls[message.from_user.id] = int(target_id)
+
+    await message.answer(f"🎯 Троллинг включён → {target_id}")
+
+@dp.message(Command("stop_troll"))
+async def stop_troll(message: Message):
+    if message.from_user.id in active_trolls:
+        del active_trolls[message.from_user.id]
+        await message.answer("Троллинг остановлен")
+    else:
+        await message.answer("Троллинг не активен")
+
+@dp.message(lambda message: message.chat.id in waiting_for_schedule_time)
+async def schedule_input(message: Message):
+    chat_id = message.chat.id
+    uid = str(message.from_user.id)
+    text = message.text.strip().lower()
+
+    if text == "отменить рассылку" or text == "отмена":
+        if uid in user_store:
+            user_store[uid].pop("schedule_time", None)
+            save_users(user_store)
+        
+        waiting_for_schedule_time.discard(chat_id)
+        await message.answer("✅ Рассылка отключена.")
+        return
+
+    try:
+        # Проверка формата
+        if ":" not in text:
+            raise ValueError
+        
+        h_str, m_str = text.split(":")
+        h, m = int(h_str), int(m_str)
+
+        if not (0 <= h < 24 and 0 <= m < 60):
+            raise ValueError
+
+        formatted_time = f"{h:02d}:{m:02d}"
+
+        # Сохранение в базу
+        if uid not in user_store:
+            user_store[uid] = {}
+        
+        user_store[uid]["username"] = message.from_user.username or user_store[uid].get("username", "unknown")
+        user_store[uid]["schedule_time"] = formatted_time
+        user_store[uid]["last_activity"] = time.time()
+        
+        # ВАЖНО: сохраняем в файл сразу
+        save_users(user_store)
+
+        waiting_for_schedule_time.discard(chat_id)
+        await message.answer(f"✅ Успешно! Теперь каждый день в <b>{formatted_time}</b> я буду присылать вам расписание (если есть пары).", parse_mode=ParseMode.HTML)
+        
+    except ValueError:
+        await message.answer("⚠️ Неверный формат. Пожалуйста, введите время как <b>08:30</b> или напишите 'Отмена'.", parse_mode=ParseMode.HTML)
+
+# ----------------- UNIVERSAL FORWARD -----------------
+@dp.message()
+async def forward_messages(message: Message): #хенлдер пересылки сообщений
+    update_user_activity(message.from_user.id, message.from_user.username)
+    # --- STOP TROLL MODE ---
+    if message.from_user.id == BOT_OWNER_ID and message.text == "/troll_stop":
+        if message.from_user.id in active_trolls:
+            del active_trolls[message.from_user.id]
+            await message.answer("🛑 Троллинг остановлен")
+        else:
+            await message.answer("Троллинг не активен")
+        return
+# --- OWNER REPLY MODE ---
+    if message.from_user.id == BOT_OWNER_ID and message.reply_to_message:
+        text = message.reply_to_message.text or ""
+
+        match = re.search(r"\((\d+)\)", text)
+        if match:
+            user_id = int(match.group(1))
+
+            try:
+                if message.text:
+                    await bot.send_message(user_id, message.text)
+
+                elif message.photo:
+                    await bot.send_photo(
+                        user_id,
+                        message.photo[-1].file_id,
+                        caption=message.caption
+                    )
+
+                elif message.video:
+                    await bot.send_video(
+                        user_id,
+                        message.video.file_id,
+                        caption=message.caption
+                    )
+
+                elif message.document:
+                    await bot.send_document(
+                        user_id,
+                        message.document.file_id,
+                        caption=message.caption
+                    )
+
+                elif message.voice:
+                    await bot.send_voice(user_id, message.voice.file_id)
+
+                elif message.sticker:
+                    await bot.send_sticker(user_id, message.sticker.file_id)
+
+            except Exception as e:
+                await message.answer(f"Ошибка отправки: {e}")
+
+            return
+
+    # ----------------- TROLL MODE -----------------
+    if message.from_user.id in active_trolls:
+        target_id = active_trolls[message.from_user.id]
+
+        try:
+            if message.text:
+                await bot.send_message(target_id, message.text)
+            elif message.photo:
+                photo = message.photo[-1].file_id
+                await bot.send_photo(target_id, photo=photo, caption=message.caption)
+            elif message.video:
+                await bot.send_video(target_id, video=message.video.file_id, caption=message.caption)
+            elif message.document:
+                await bot.send_document(target_id, document=message.document.file_id, caption=message.caption)
+            elif message.audio:
+                await bot.send_audio(target_id, audio=message.audio.file_id, caption=message.caption)
+            elif message.voice:
+                await bot.send_voice(target_id, voice=message.voice.file_id, caption=message.caption)
+            elif message.animation:
+                await bot.send_animation(target_id, animation=message.animation.file_id, caption=message.caption)
+            elif message.video_note:
+                await bot.send_video_note(
+                    target_id,
+                    video_note=message.video_note.file_id,
+                    duration=message.video_note.duration,
+                    length=message.video_note.length
+                )
+            elif message.sticker:
+                await bot.send_sticker(target_id, sticker=message.sticker.file_id)
+            else:
+                await bot.send_message(target_id, "⚠️ Неподдерживаемый тип сообщения")
+        except Exception as e:
+            await message.answer(f"⚠️ Ошибка при пересылке: {e}")
+
+        return  # чтобы сообщение не пошло дальше в обычный forward
+
+    # ----------------- FORWARD REPLIES -----------------
+    if message.from_user.id == BOT_OWNER_ID:
+        return  # не пересылать свои сообщения
+
+    chat_id = BOT_OWNER_ID
+    user_info = f"От @{message.from_user.username} ({message.from_user.id})"
+
+    try:
+        if message.text:
+            await bot.send_message(chat_id, "💬 " + user_info + ":\n" + message.text)
+        elif message.photo:
+            photo = message.photo[-1].file_id
+            caption = "🖼️ " + user_info + ":\n" + (message.caption or "")
+            await bot.send_photo(chat_id, photo=photo, caption=caption)
+        elif message.document:
+            doc = message.document.file_id
+            caption = "📄 " + user_info + ":\n" + (message.caption or "")
+            await bot.send_document(chat_id, document=doc, caption=caption)
+        elif message.video:
+            video = message.video.file_id
+            caption = "🎥 " + user_info + ":\n" + (message.caption or "")
+            await bot.send_video(chat_id, video=video, caption=caption)
+        elif message.video_note:
+            await bot.send_message(chat_id, f"🎬 {user_info}")
+            await bot.send_video_note(
+                chat_id,
+                video_note=message.video_note.file_id,
+                duration=message.video_note.duration,
+                length=message.video_note.length
+            )
+        elif message.audio:
+            await bot.send_audio(chat_id, audio=message.audio.file_id, caption="🎵 " + user_info)
+        elif message.voice:
+            await bot.send_voice(chat_id, voice=message.voice.file_id, caption="🎙️ " + user_info)
+        elif message.sticker:
+            await bot.send_message(chat_id, f"⭐ {user_info}: стикер")
+            await bot.send_sticker(chat_id, sticker=message.sticker.file_id)
+        elif message.animation:
+            await bot.send_animation(chat_id, animation=message.animation.file_id, caption="🎞️ " + user_info)
+        else:
+            await bot.send_message(chat_id, f"❓ Неподдерживаемый тип сообщения от {message.from_user.id}")
+
+    except Exception as e:
+        await bot.send_message(chat_id, f"⚠️ Ошибка при пересылке от {message.from_user.id}: {e}")
+
+# ----------------- RUN -----------------
+async def main():
+    global _shared_session
+    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+    _shared_session = aiohttp.ClientSession(connector=connector)
+    asyncio.create_task(schedule_sender())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # закрыть сессию сохранить кеш
+        try:
+            if _shared_session:
+                await _shared_session.close()
+        except Exception as e:
+            logger.warning("Error closing session: %s", e)
+        _save_cache_file()
+
+if __name__ == "__main__":
+    asyncio.run(main())
