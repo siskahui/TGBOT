@@ -8,3 +8,4 @@ page_cache.pkl
 push.sh
 selections.json
 users.json
+rollback.sh
