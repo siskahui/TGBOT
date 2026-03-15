@@ -15,12 +15,6 @@ import logging
 import pickle
 import time  # used for cache timestamps
 from collections import OrderedDict  # added for LRU locks
-#Асинхронные запросы asyncio
-#Кеширование загруженных страниц
-#Автоопределение текущей учебной недели
-#Сохранение кеша и данных в файл
-#Защита от message too big
-#Хендлер пересылки и возможность отправки сообщений юзерам
 
 # ----------------- CONFIG -----------------
 load_dotenv("/root/TGBOT/.env") # файл .env с записанным токеном, путь к файлу
@@ -180,6 +174,13 @@ def build_url_for_wk(wk: int | None, chat_id: int) -> str:
 
     return f"{base}&wk={wk}"
 
+def get_current_monday_ts() -> float:
+    """Возвращает timestamp понедельника 00:00 текущей недели"""
+    now = datetime.datetime.now()
+    days_to_monday = now.weekday()          # 0 = понедельник
+    monday = now - datetime.timedelta(days=days_to_monday)
+    monday_midnight = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    return monday_midnight.timestamp()
 # ----------------- INLINE KEYBOARDS -----------------
 def make_inline_kb():
     return InlineKeyboardMarkup(
@@ -471,34 +472,35 @@ _load_cache_file()
 
 # ----------------- АВТООПРЕДЕЛЕНИЕ НЕДЕЛИ -----------------
 async def get_current_wk() -> int:
-    """Автоматически определяет текущую неделю с сайта (кэш 24 часа)"""
     global CURRENT_WK_CACHE
     now = time.time()
+    monday_ts = get_current_monday_ts()
 
-    # Возвращаем кэш, если он свежий
-    if now - CURRENT_WK_CACHE["ts"] < 86400:  # 24 часа
+    # Если кэш старше начала этой недели — обновляем
+    if CURRENT_WK_CACHE["ts"] < monday_ts:
+        # Обновляем через любую группу (ИСПП-34)
+        url = "https://lk.ks.psuti.ru/?mn=2&obj=218"
+        html = await get_cached_page(_shared_session, url)
+
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            # Ищем ссылку "следующая неделя"
+            next_link = soup.find("a", string=lambda text: text and "следующая неделя" in text.lower())
+            if next_link and "wk=" in next_link.get("href", ""):
+                try:
+                    next_wk = int(next_link["href"].split("wk=")[-1].split("&")[0])
+                    wk = next_wk - 1
+                    CURRENT_WK_CACHE = {"wk": wk, "ts": now}
+                    logger.info(f"🔄 Определена текущая неделя: {wk} (обновлено с понедельника 00:00)")
+                    return wk
+                except Exception:
+                    pass
+
+        # Fallback — не обновляем ts, чтобы следующая итерация снова попыталась
+        logger.warning("Не удалось определить wk, используем старый кэш до успешного обновления")
         return CURRENT_WK_CACHE["wk"]
 
-    # Обновляем через любую группу (ИСПП-34)
-    url = "https://lk.ks.psuti.ru/?mn=2&obj=218"
-    html = await get_cached_page(_shared_session, url)
-
-    if html:
-        soup = BeautifulSoup(html, "html.parser")
-        # Ищем ссылку "следующая неделя"
-        next_link = soup.find("a", string=lambda text: text and "следующая неделя" in text.lower())
-        if next_link and "wk=" in next_link.get("href", ""):
-            try:
-                next_wk = int(next_link["href"].split("wk=")[-1].split("&")[0])
-                wk = next_wk - 1
-                CURRENT_WK_CACHE = {"wk": wk, "ts": now}
-                logger.info(f"🔄 Определена текущая неделя: {wk}")
-                return wk
-            except:
-                pass
-
-    # Fallback на последний известный
-    logger.warning("Не удалось определить wk, используем кэш")
+    # Кэш ещё актуален для этой недели
     return CURRENT_WK_CACHE["wk"]
 
 def _get_lock_for_url(url: str) -> asyncio.Lock:
@@ -915,13 +917,43 @@ async def start_troll(message: Message):
 
     await message.answer(f"🎯 Троллинг включён → {target_id}")
 
-@dp.message(Command("stop_troll"))
-async def stop_troll(message: Message):
+@dp.message(Command("troll_stop"))
+async def troll_stop(message: Message):
     if message.from_user.id in active_trolls:
         del active_trolls[message.from_user.id]
         await message.answer("Троллинг остановлен")
     else:
         await message.answer("Троллинг не активен")
+
+@dp.message(Command("debug_week"))
+async def debug_week(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        return
+
+    await message.answer("🔍 <b>Отладка автоопределения недели</b>\n", parse_mode=ParseMode.HTML)
+
+    monday_ts = get_current_monday_ts()
+    now = time.time()
+
+    current_wk = await get_current_wk()   # ← вызовет реальную функцию
+
+    text = (
+        f"📅 Сегодня: <b>{datetime.datetime.now().strftime('%A %d.%m.%Y %H:%M')}</b>\n\n"
+        f"Понедельник этой недели (00:00): <b>{datetime.datetime.fromtimestamp(monday_ts).strftime('%d.%m.%Y %H:%M')}</b>\n"
+        f"monday_ts = <code>{monday_ts}</code>\n\n"
+        f"CURRENT_WK_CACHE:\n"
+        f"   wk = <b>{CURRENT_WK_CACHE['wk']}</b>\n"
+        f"   ts = <code>{CURRENT_WK_CACHE['ts']}</code> "
+        f"({'сегодня' if CURRENT_WK_CACHE['ts'] >= monday_ts else 'СТАРЫЙ — будет обновлён'})\n\n"
+        f"✅ Определённая неделя: <b>{current_wk}</b>\n"
+        f"(последний парсинг сайта был {'успешным' if CURRENT_WK_CACHE['wk'] > 300 else 'неудачным'})"
+    )
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+    # Принудительно обновляем кеш прямо сейчас для теста
+    CURRENT_WK_CACHE["ts"] = 0  # сбрасываем ts → следующее нажатие кнопки или рассылка обновит
+    await message.answer("🔄 Кеш недели сброшен! Теперь нажми кнопку «🔁 обновить» или дождись рассылки — увидишь новую неделю сразу.")
 
 @dp.message(lambda message: message.chat.id in waiting_for_schedule_time)
 async def schedule_input(message: Message):
@@ -972,14 +1004,6 @@ async def schedule_input(message: Message):
 @dp.message()
 async def forward_messages(message: Message): #хенлдер пересылки сообщений
     update_user_activity(message.from_user.id, message.from_user.username)
-    # --- STOP TROLL MODE ---
-    if message.from_user.id == BOT_OWNER_ID and message.text == "/troll_stop":
-        if message.from_user.id in active_trolls:
-            del active_trolls[message.from_user.id]
-            await message.answer("🛑 Троллинг остановлен")
-        else:
-            await message.answer("Троллинг не активен")
-        return
 # --- OWNER REPLY MODE ---
     if message.from_user.id == BOT_OWNER_ID and message.reply_to_message:
         text = message.reply_to_message.text or ""
