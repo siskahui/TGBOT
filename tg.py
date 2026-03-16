@@ -246,109 +246,128 @@ def build_groups_kb(groups_list):
 
 # ----------------- HTML PARSER -------------------------
 def parse_schedule_pretty(html: str) -> str:
-    if not html:
-        return "⚠️ Расписание не загрузилось (пустая страница)"
+    if not html or not html.strip():
+        return "⚠️ Расписание не загрузилось"
 
     soup = BeautifulSoup(html, "html.parser")
-    IGNORE_PHRASES = {"предыдущая неделя", "выберите группу", "первый курс"}
-
     result = []
-    last_block = None
+    last_day = None
 
-    trs = list(soup.find_all("tr"))
-    for tr in trs:
+    for tr in soup.find_all("tr"):
+        # === День недели ===
         h3 = tr.find("h3")
         if h3:
             day = " ".join(h3.get_text(" ", strip=True).split())
-            if not day:
+            if any(word in day.lower() for word in ["предыдущая", "выберите", "курс:"]):
                 continue
-            lowday = day.lower()
-            if any(p in lowday for p in IGNORE_PHRASES):
-                continue
-            header = f"\n📅 <b>{day}</b>\n"
-            if header != last_block:
-                result.append(header)
-                last_block = header
-
-        tds = tr.find_all("td")
-        if len(tds) >= 4:
-            num = tds[0].get_text(strip=True)
-            if not num.isdigit():
-                continue
-
-            time_lines = [x.strip() for x in tds[1].stripped_strings]
-            time = time_lines[0] if time_lines else ""
-            transfer = ""
-            for t in time_lines[1:]:
-                if "перенос" in t.lower():
-                    transfer = t
-
-            cell = tds[3]
-            lines = [x.strip() for x in cell.stripped_strings if x.strip()]
-            if not lines:
-                continue
-
-            # ФИКС ЗАМЕН
-            clean_lines = []
-            for l in lines:
-                low = l.lower()
-                if low == "на:":
-                    clean_lines = []
-                    continue
-                if low == "замена":
-                    continue
-                clean_lines.append(l)
-
-            subject = clean_lines[0] if clean_lines else ""
-            teacher = ""
-            if len(clean_lines) > 1:
-                t = clean_lines[1]
-                teacher = t[1:-1] if t.startswith("(") and t.endswith(")") else t
-
-            address = ""
-            room = ""
-            for l in clean_lines[2:]:
-                low = l.lower()
-                if "каб" in low or "ауд" in low:
-                    room = l
-                elif any(c.isdigit() for c in l) and ("ул" in low or "шоссе" in low):
-                    address = l
-
-            pair = f"▫️ <b>{num}</b> | {time}"
-            if transfer:
-                pair += f" {transfer}"
-            pair += "\n"
-
-            if subject:
-                if subject.lower() == "свободное время":
-                    pair += f"   💤 {subject}\n"
-                else:
-                    pair += f"   📚 {subject}\n"
-
-            if teacher and subject.lower() != "свободное время":
-                pair += f"   👤 {teacher}\n"
-            if address:
-                pair += f"   🏢 {address}\n"
-            if room:
-                pair += f"   🚪 {room}\n"
-
-            if pair != last_block:
-                result.append(pair)
-                last_block = pair
-
-    cleaned = []
-    for line in result:
-        if cleaned and cleaned[-1].strip() == line.strip():
+            if day != last_day:
+                if result:                     # отступ перед новым днём
+                    result.append("\n")
+                result.append(f"📅 <b>{day}</b>\n\n")   # ← вот тут добавили пустую строку
+                last_day = day
             continue
-        cleaned.append(line)
 
-    text = "\n".join(cleaned).strip()
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) < 7 or not tds[0].get_text(strip=True).isdigit():
+            continue
 
-    # === ЗАЩИТА ОТ ПУСТОГО РАСПИСАНИЯ ===
-    if not text:
-        return "⚠️ Расписание пустое или не найдено на эту неделю.\nПопробуйте кнопку «🔁 обновить»"
+        num = tds[0].get_text(strip=True)
+        time_str = " ".join(tds[1].stripped_strings).strip()
+        way = tds[2].get_text(strip=True).strip()
 
-    return text
+        # === ЯЧЕЙКА ДИСЦИПЛИНЫ (главная фикса замен) ===
+        disc_lines = [line.strip() for line in tds[3].stripped_strings if line.strip()]
+
+        replacement_note = ""
+        subject = ""
+        teacher = ""
+        address = ""
+        room = ""
+
+        # Находим "на:" и берём всё после него как реальную пару
+        after_na_index = -1
+        for i, line in enumerate(disc_lines):
+            if "на:" in line.lower():
+                after_na_index = i + 1
+                replacement_note = " ".join(disc_lines[:i])
+                break
+
+        # Если нашли "на:", парсим только часть после него
+        lines_to_parse = disc_lines[after_na_index:] if after_na_index != -1 else disc_lines
+
+        for line in lines_to_parse:
+            low = line.lower()
+            if not subject and not low.startswith("(") and not any(k in low for k in ["шоссе", "кабинет", "ауд"]):
+                subject = line
+            elif not teacher and ("(" in line or len(line.split()) >= 2):
+                teacher = line.strip("() ")
+            elif any(k in low for k in ["шоссе", "ул.", "московское"]):
+                address = line
+            elif "кабинет" in low or "ауд" in low:
+                room = line
+
+        # Если после замены "Свободное время" — ставим 💤
+        if "свободное время" in " ".join(lines_to_parse).lower():
+            subject = "Свободное время"
+
+        # === Ресурсы (все ссылки) ===
+        resources = []
+        if len(tds) > 5:
+            for a in tds[5].find_all("a", href=True):
+                url = a["href"].strip()
+                txt = a.get_text(strip=True).strip() or "Ссылка"
+                resources.append((txt, url))
+            if not resources:
+                txt = tds[5].get_text(strip=True).strip()
+                if txt:
+                    resources.append((txt, ""))
+
+        # === Тема и задание ===
+        theme = tds[4].get_text(strip=True).strip() if len(tds) > 4 else ""
+        task = tds[6].get_text(strip=True).strip() if len(tds) > 6 else ""
+
+        # === Вывод пары ===
+        line = f"▫️ <b>{num}</b> | {time_str}"
+        if way:
+            line += f" <i>({way})</i>"
+        line += "\n"
+
+        # === ЗАМЕНА — теперь на новой строке + слово "на" в конце ===
+        if replacement_note:
+            note = replacement_note.strip()
+            if not note.lower().endswith("на"):
+                note += " на"
+            line += f"   <b>⚠️ {note}</b>\n"
+
+        if subject:
+            if "свободное" in subject.lower():
+                line += f"   💤 {subject}\n"
+            else:
+                line += f"   📚 {subject}\n"
+                if teacher:
+                    line += f"   👤 {teacher}\n"
+                if address:
+                    line += f"   🏢 {address}\n"
+                if room:
+                    line += f"   🚪 {room}\n"
+
+        if theme:
+            line += f"   📝 <b>Тема:</b> {theme}\n"
+
+        for txt, url in resources:
+            if url:
+                line += f'   🔗 <a href="{url}">{txt}</a>\n'
+            else:
+                line += f"   🔗 {txt}\n"
+
+        if task:
+            line += f"   📌 Задание: {task}\n"
+
+        line += "\n"   # отступ между парами
+        result.append(line)
+
+    text = "".join(result).strip()
+    return text or "⚠️ Расписание пустое"
 
 def extract_today(schedule_text: str) -> str:
 
