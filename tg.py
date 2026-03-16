@@ -332,12 +332,12 @@ def parse_schedule_pretty(html: str) -> str:
             line += f" <i>({way})</i>"
         line += "\n"
 
-        # === ЗАМЕНА — теперь на новой строке + слово "на" в конце ===
+        # === ЗАМЕНА — на новой строке + слово "на" + отступ после ===
         if replacement_note:
             note = replacement_note.strip()
             if not note.lower().endswith("на"):
                 note += " на"
-            line += f"   <b>⚠️ {note}</b>\n"
+            line += f"   <b>⚠️ {note}</b>\n\n"   # ← вот тут добавил пустую строку
 
         if subject:
             if "свободное" in subject.lower():
