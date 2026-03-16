@@ -589,89 +589,74 @@ async def get_cached_page(session, url):
         return ""
 
 # ----------------- SEND MESSAGE / EDIT -----------------
-async def send_or_edit_text(text, chat_id, reply_message=None):
+async def send_or_edit_text(text: str, chat_id: int):
     if not text or not text.strip():
         text = "⚠️ Расписание не загрузилось. Нажмите «🔁 обновить»"
 
-    last_id = last_msg_per_chat.get(chat_id)
-    last_text = last_text_per_chat.get(chat_id)
+    MAX_LEN = 3900
 
-    MAX_LEN = 4000
+    # Если короткое — одно сообщение
+    if len(text) <= MAX_LEN:
+        last_id = last_msg_per_chat.get(chat_id)
+        last_text = last_text_per_chat.get(chat_id)
 
-    if len(text) > MAX_LEN:
-        parts = []
+        try:
+            if last_id and text == last_text:
+                return
 
-        current = ""
-        for line in text.split("\n"):
-            if len(current) + len(line) + 1 > MAX_LEN:
-                parts.append(current)
-                current = line
-            else:
-                current += "\n" + line if current else line
-
-        if current:
-            parts.append(current)
-
-        for part in parts:
-            await bot.send_message(
-                chat_id,
-                part,
-                parse_mode=ParseMode.HTML,
-                reply_markup=make_inline_kb()
-            )
-
-        return
-
-    if last_text is not None and text == last_text:
-        if last_id:
-            try:
+            if last_id:
                 await bot.edit_message_text(
                     text=text,
                     chat_id=chat_id,
                     message_id=last_id,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=make_inline_kb()
-                )
-            except TelegramBadRequest as e:
-                err = str(e).lower()
-                if "message is not modified" in err or "specified new message content is the same as the current content" in err:
-                    return
-                logger.debug("edit_message_text TelegramBadRequest for %s: %s", chat_id, e)
-                last_msg_per_chat.pop(chat_id, None)
-            except Exception as e:
-                logger.debug("edit_message_text unexpected error: %s", e)
-                last_msg_per_chat.pop(chat_id, None)
-        else:
-            return
-    else:
-        if last_id:
-            try:
-                await bot.edit_message_text(
-                    text=text,
-                    chat_id=chat_id,
-                    message_id=last_id,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=make_inline_kb()
+                    reply_markup=make_inline_kb(),
+                    disable_web_page_preview=True
                 )
                 last_text_per_chat[chat_id] = text
                 return
-            except TelegramBadRequest as e:
-                err = str(e).lower()
-                if "message is not modified" in err or "specified new message content is the same as the current content" in err:
-                    last_text_per_chat[chat_id] = text
-                    return
-                logger.debug("edit_message_text TelegramBadRequest for %s: %s", chat_id, e)
-                last_msg_per_chat.pop(chat_id, None)
-            except Exception as e:
-                logger.debug("edit_message_text unexpected error: %s", e)
-                last_msg_per_chat.pop(chat_id, None)
+        except Exception:
+            last_msg_per_chat.pop(chat_id, None)
+            last_text_per_chat.pop(chat_id, None)
 
+    # === Делим по дням правильно ===
+    # Разделяем по "📅 ", но первый блок (с группой) оставляем как есть
+    parts = text.split("📅 ")
+    header = parts[0].strip()                    # 👤 Ваша группа: ИСПИ-7
+    days = ["📅 " + p.strip() for p in parts[1:] if p.strip()]
+
+    messages = []
+    current = header
+
+    for day in days:
+        if len(current) + len(day) + 2 > MAX_LEN and current != header:
+            messages.append(current.strip())
+            current = day
+        else:
+            current += "\n\n" + day
+
+    if current.strip():
+        messages.append(current.strip())
+
+    # Отправляем все кроме последнего без кнопок
+    for part in messages[:-1]:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=part,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+
+    # Последнее сообщение с кнопками
+    final_text = messages[-1]
     msg = await bot.send_message(
-        chat_id,
-        text,
+        chat_id=chat_id,
+        text=final_text,
         parse_mode=ParseMode.HTML,
-        reply_markup=make_inline_kb()
+        reply_markup=make_inline_kb(),
+        disable_web_page_preview=True
     )
+
     last_msg_per_chat[chat_id] = msg.message_id
     last_text_per_chat[chat_id] = text
 
