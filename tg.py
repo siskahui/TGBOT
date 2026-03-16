@@ -711,7 +711,8 @@ async def start(message: Message):
 
     await bot.send_message(
         message.chat.id,
-        "йоу собаки я наруто узумаки", #приветственное сообщение
+        "ТГ БОТ РАСПИСАНИЕ ПГУТИ\n\n"
+        "https://github.com/Sp0nge-bob/TGBOT", #приветственное сообщение
         parse_mode=ParseMode.HTML,
         reply_markup=make_inline_kb()
     )
