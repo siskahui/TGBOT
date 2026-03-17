@@ -158,7 +158,7 @@ groups: dict[str, dict] = load_json_file(GROUPS_FILE)
 
 async def periodic_save():
     while True:
-        await asyncio.sleep(600) # 10 минут
+        await asyncio.sleep(1200) # 20 минут
         try:
             save_users(user_store)
             logger.info("💾 Автосохранение пользователей выполнено")
@@ -570,13 +570,8 @@ async def get_current_wk() -> int:
     return CURRENT_WK_CACHE["wk"]
 
 def _get_lock_for_url(url: str) -> asyncio.Lock:
-    """
-    Return a lock for the URL, using an LRU-limited OrderedDict to avoid unbounded growth.
-    Evict oldest entries when exceeding LOCKS_CACHE_MAX.
-    """
     lock = _locks_per_url.pop(url, None)
     if lock:
-        # степа лох
         _locks_per_url[url] = lock
         return lock
     lock = asyncio.Lock()
