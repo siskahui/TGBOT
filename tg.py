@@ -235,6 +235,16 @@ def make_inline_kb():
         ]
     )
 
+def build_schedule_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔙 Назад", callback_data="schedule_back"),
+                InlineKeyboardButton(text="❌ Отменить рассылку", callback_data="schedule_disable")
+            ]
+        ]
+    )
+
 def build_courses_kb():
     rows = []
 
@@ -704,10 +714,14 @@ async def start(message: Message):
     register_user_from_message(message)
     update_user_activity(message.from_user.id, message.from_user.username)
 
+    chat_id = message.chat.id
+
+    last_msg_per_chat.pop(chat_id, None)
+    last_text_per_chat.pop(chat_id, None)
+
     await bot.send_message(
-        message.chat.id,
-        "ТГ БОТ РАСПИСАНИЕ ПГУТИ\n\n"
-        "https://github.com/Sp0nge-bob/TGBOT", #приветственное сообщение
+        chat_id,
+        "ТГ БОТ РАСПИСАНИЕ ПГУТИ\n\nhttps://github.com/Sp0nge-bob/TGBOT",
         parse_mode=ParseMode.HTML,
         reply_markup=make_inline_kb()
     )
@@ -853,7 +867,49 @@ async def ask_schedule_time(cb: CallbackQuery):
         f"ВАЖНО: Бот будет отправлять расписание той группы. Которая была вами выбрана на момент отправки.\n\n"
         f"ВАЖНО: Во избежание спама бот может отправлять рассылку лишь 1 раз в день!\n"
     )
-    await cb.message.answer(text, parse_mode=ParseMode.HTML)
+    await cb.message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_schedule_kb()
+    )
+
+@dp.callback_query(F.data == "schedule_back")
+async def schedule_back(cb: CallbackQuery):
+    await cb.answer()
+    chat_id = cb.message.chat.id
+
+    waiting_for_schedule_time.discard(chat_id)
+
+    msg = await bot.send_message(
+        chat_id,
+        "Вы вернулись назад",
+        reply_markup=make_inline_kb()
+    )
+
+    last_msg_per_chat[chat_id] = msg.message_id
+    last_text_per_chat[chat_id] = "Вы вернулись назад"
+
+@dp.callback_query(F.data == "schedule_disable")
+async def schedule_disable(cb: CallbackQuery):
+    await cb.answer()
+
+    chat_id = cb.message.chat.id
+    uid = str(cb.from_user.id)
+
+    if uid in user_store:
+        user_store[uid].pop("schedule_time", None)
+        save_users(user_store)
+
+    waiting_for_schedule_time.discard(chat_id)
+
+    msg = await bot.send_message(
+        chat_id,
+        "✅ Рассылка отключена",
+        reply_markup=make_inline_kb()
+    )
+
+    last_msg_per_chat[chat_id] = msg.message_id
+    last_text_per_chat[chat_id] = "✅ Рассылка отключена"
 
 # ----------------- TRIGGER COMMANDS -----------------
 @dp.message(Command("stats"))
