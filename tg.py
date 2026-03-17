@@ -3,6 +3,7 @@ import re
 import aiohttp
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -27,6 +28,8 @@ USER_FILE = "users.json" #Куда сохраняются пользовател
 GROUPS_FILE = "groups.json" #Где хранится список групп + курсы
 SELECTION_FILE = "selections.json" #Закешированный выбор юзеров
 CURRENT_WK_CACHE: dict = {"wk": 323, "ts": 0.0}
+callback_cooldown = {}
+CALLBACK_DELAY = 1.0  # секунды
 
 # CACHE config
 CACHE_TTL_SECONDS = 300  # TTL Кеша
@@ -36,6 +39,30 @@ MAX_CACHE_AGE_DAYS = 1 #Время хранения кеша в бекапе
 
 # LOCKS LRU config
 LOCKS_CACHE_MAX = 1000  # URL локи
+
+#-------------------АНТИФЛУД------------------------------
+def is_flood(user_id: int) -> bool:
+    now = time.time()
+    last = callback_cooldown.get(user_id, 0)
+
+    if now - last < CALLBACK_DELAY:
+        return True
+
+    callback_cooldown[user_id] = now
+    return False
+
+
+class CallbackAntiFloodMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if hasattr(event, "from_user"):
+            user_id = event.from_user.id
+
+            if is_flood(user_id):
+                if hasattr(event, "answer"):
+                    await event.answer("Лелеле тише ковбой")
+                return
+
+        return await handler(event, data)
 
 # ----------------- LOGGING -----------------
 from logging.handlers import RotatingFileHandler
@@ -59,6 +86,7 @@ logger.addHandler(console_handler)
 # ----------------- STATE -----------------
 bot = Bot(TOKEN)
 dp = Dispatcher()
+dp.callback_query.middleware(CallbackAntiFloodMiddleware())
 START_TIME = time.time()
 TOTAL_REQUESTS = 0
 
@@ -826,6 +854,7 @@ async def week_buttons(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "day_today")
 async def show_today(cb: CallbackQuery):
+
     await cb.answer()
 
     wk = await get_current_wk()
@@ -848,6 +877,7 @@ waiting_for_schedule_time = set()
 
 @dp.callback_query(F.data == "setup_schedule")
 async def ask_schedule_time(cb: CallbackQuery):
+
     await cb.answer()
     chat_id = cb.message.chat.id
     uid = str(cb.from_user.id)
@@ -875,6 +905,7 @@ async def ask_schedule_time(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "schedule_back")
 async def schedule_back(cb: CallbackQuery):
+
     await cb.answer()
     chat_id = cb.message.chat.id
 
@@ -891,6 +922,7 @@ async def schedule_back(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "schedule_disable")
 async def schedule_disable(cb: CallbackQuery):
+
     await cb.answer()
 
     chat_id = cb.message.chat.id
