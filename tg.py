@@ -9,6 +9,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
+from collections import deque
 import tempfile
 import shutil
 import datetime
@@ -29,7 +30,10 @@ GROUPS_FILE = "groups.json" #Где хранится список групп + �
 SELECTION_FILE = "selections.json" #Закешированный выбор юзеров
 CURRENT_WK_CACHE: dict = {"wk": 323, "ts": 0.0}
 callback_cooldown = {}
-CALLBACK_DELAY = 1.0  # секунды
+CALLBACK_DELAY = 1.0  # Настройка антифлуда на кнопки
+forward_queue = deque()
+user_message_cooldown = {}
+USER_DELAY = 1.0  # Антифлуд на сообщения от одного юзера
 
 # CACHE config
 CACHE_TTL_SECONDS = 300  # TTL Кеша
@@ -63,6 +67,16 @@ class CallbackAntiFloodMiddleware(BaseMiddleware):
                 return
 
         return await handler(event, data)
+
+def is_user_spamming(user_id: int) -> bool:
+    now = time.time()
+    last = user_message_cooldown.get(user_id, 0)
+
+    if now - last < USER_DELAY:
+        return True
+
+    user_message_cooldown[user_id] = now
+    return False
 
 # ----------------- LOGGING -----------------
 from logging.handlers import RotatingFileHandler
@@ -1277,42 +1291,123 @@ async def forward_messages(message: Message):
     user_info = f"От @{message.from_user.username} ({message.from_user.id})"
 
     try:
+        if is_user_spamming(message.from_user.id):
+            return
+
         if message.text:
-            await bot.send_message(chat_id, "💬 " + user_info + ":\n" + message.text)
+            forward_queue.append((
+                bot.send_message,
+                (chat_id,),
+                {"text": "💬 " + user_info + ":\n" + message.text}
+            ))
+
         elif message.photo:
             photo = message.photo[-1].file_id
             caption = "🖼️ " + user_info + ":\n" + (message.caption or "")
-            await bot.send_photo(chat_id, photo=photo, caption=caption)
+            forward_queue.append((
+                bot.send_photo,
+                (chat_id,),
+                {"photo": photo, "caption": caption}
+            ))
+
         elif message.document:
             doc = message.document.file_id
             caption = "📄 " + user_info + ":\n" + (message.caption or "")
-            await bot.send_document(chat_id, document=doc, caption=caption)
+            forward_queue.append((
+                bot.send_document,
+                (chat_id,),
+                {"document": doc, "caption": caption}
+            ))
+
         elif message.video:
             video = message.video.file_id
             caption = "🎥 " + user_info + ":\n" + (message.caption or "")
-            await bot.send_video(chat_id, video=video, caption=caption)
+            forward_queue.append((
+                bot.send_video,
+                (chat_id,),
+                {"video": video, "caption": caption}
+            ))
+
         elif message.video_note:
-            await bot.send_message(chat_id, f"🎬 {user_info}")
-            await bot.send_video_note(
-                chat_id,
-                video_note=message.video_note.file_id,
-                duration=message.video_note.duration,
-                length=message.video_note.length
-            )
+            forward_queue.append((
+                bot.send_message,
+                (chat_id,),
+                {"text": f"🎬 {user_info}"}
+            ))
+            forward_queue.append((
+                bot.send_video_note,
+                (chat_id,),
+                {
+                    "video_note": message.video_note.file_id,
+                    "duration": message.video_note.duration,
+                    "length": message.video_note.length
+                }
+            ))
+
         elif message.audio:
-            await bot.send_audio(chat_id, audio=message.audio.file_id, caption="🎵 " + user_info)
+            forward_queue.append((
+                bot.send_audio,
+                (chat_id,),
+                {"audio": message.audio.file_id, "caption": "🎵 " + user_info}
+            ))
+
         elif message.voice:
-            await bot.send_voice(chat_id, voice=message.voice.file_id, caption="🎙️ " + user_info)
+            forward_queue.append((
+                bot.send_voice,
+                (chat_id,),
+                {"voice": message.voice.file_id, "caption": "🎙️ " + user_info}
+            ))
+
         elif message.sticker:
-            await bot.send_message(chat_id, f"⭐ {user_info}: стикер")
-            await bot.send_sticker(chat_id, sticker=message.sticker.file_id)
+            forward_queue.append((
+                bot.send_message,
+                (chat_id,),
+                {"text": f"⭐ {user_info}: стикер"}
+            ))
+            forward_queue.append((
+                bot.send_sticker,
+                (chat_id,),
+                {"sticker": message.sticker.file_id}
+            ))
+
         elif message.animation:
-            await bot.send_animation(chat_id, animation=message.animation.file_id, caption="🎞️ " + user_info)
+            forward_queue.append((
+                bot.send_animation,
+                (chat_id,),
+                {"animation": message.animation.file_id, "caption": "🎞️ " + user_info}
+            ))
+
         else:
-            await bot.send_message(chat_id, f"❓ Неподдерживаемый тип сообщения от {message.from_user.id}")
+            forward_queue.append((
+                bot.send_message,
+                (chat_id,),
+                {"text": f"❓ Неподдерживаемый тип сообщения от {message.from_user.id}"}
+            ))
 
     except Exception as e:
-        await bot.send_message(chat_id, f"⚠️ Ошибка при пересылке от {message.from_user.id}: {e}")
+        forward_queue.append((
+            bot.send_message,
+            (chat_id,),
+            {"text": f"⚠️ Ошибка при пересылке от {message.from_user.id}: {e}"}
+       ))
+
+async def forward_worker():
+    while True:
+        if forward_queue:
+            func, args, kwargs = forward_queue.popleft()
+
+            try:
+                await func(*args, **kwargs)
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                if "retry after" in str(e).lower():
+                    await asyncio.sleep(3)
+                    forward_queue.appendleft((func, args, kwargs))
+                else:
+                    logger.error(f"Ошибка пересылки: {e}")
+        else:
+            await asyncio.sleep(0.1)
 
 # ----------------- RUN -----------------
 async def main():
@@ -1324,7 +1419,8 @@ async def main():
     # Запуск фоновых задач
     asyncio.create_task(schedule_sender())
     asyncio.create_task(periodic_save())
-    
+    asyncio.create_task(forward_worker())
+
     try:
         await dp.start_polling(bot)
     finally:
