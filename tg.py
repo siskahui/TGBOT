@@ -458,35 +458,24 @@ def parse_schedule_pretty(html: str) -> str:
     text = "".join(result).strip()
     return text or "⚠️ Расписание пустое"
 
+# ----------------- SCHEDULE SENDER (РАССЫЛКА) -----------------
 def extract_today(schedule_text: str) -> str:
-
     days = [
-        "понедельник",
-        "вторник",
-        "среда",
-        "четверг",
-        "пятница",
-        "суббота",
-        "воскресенье"
+        "понедельник", "вторник", "среда", "четверг",
+        "пятница", "суббота", "воскресенье"
     ]
-
     today = days[datetime.datetime.now().weekday()]
 
     blocks = schedule_text.split("📅")
-
     for block in blocks:
         if today in block.lower():
             return "📅 " + block.strip()
-
-    return "Сегодня занятий нет"
+    return "📅 Сегодня занятий нет (или день не найден в расписании)"
 
 def has_classes_today(week_text: str) -> bool:
-    """Проверяет, есть ли сегодня пары (не пустой ли текст для текущего дня)"""
     today_text = extract_today(week_text)
-    # Если в тексте только название дня недели и нет слов 'пара' или времени
-    if len(today_text.strip()) < 30 or "Пары на сегодня не найдены" in today_text:
-        return False
-    return True
+    # Отправляем ВСЕГДА, если блок дня есть
+    return len(today_text.strip()) > 10 and "не найден" not in today_text.lower()
 
 async def schedule_sender():
     while True:
@@ -495,44 +484,63 @@ async def schedule_sender():
             now_str = now_dt.strftime("%H:%M")
             today_iso = datetime.date.today().isoformat()
 
-            for uid_str, info in user_store.items():
+            logger.info(f"🔄 Рассылка: проверка в {now_str} (сегодня {today_iso})")
+
+            sent_count = 0
+            for uid_str, info in list(user_store.items()):
                 target_time = info.get("schedule_time")
-                
-                if target_time == now_str:
-                    # Проверяем, не отправляли ли уже сегодня
-                    if info.get("last_sent_date") == today_iso:
-                        continue
-                    
-                    uid_int = int(uid_str)
-                    
-                    # Проверяем, выбрана ли группа
-                    if uid_int not in selected_group_per_chat:
-                        continue
+                if not target_time:
+                    continue
 
-                    wk = await get_current_wk()
-                    url = build_url_for_wk(wk, uid_int)
-                    
-                    async with _shared_session.get(url) as resp:
-                        html = await resp.text()
-                    
-                    week_text = parse_schedule_pretty(html)
+                if target_time != now_str:
+                    continue
 
-                    # Отправляем только если есть пары
-                    if has_classes_today(week_text):
-                        today_text = extract_today(week_text)
-                        group = selected_group_per_chat.get(uid_int, "не выбрана")
-                        await bot.send_message(
-                            uid_int, 
-                            f"👤 <b>Ваша группа:</b> {group}\n🔔 <b>Ваше расписание на сегодня:</b>\n\n{today_text}",
-                            parse_mode=ParseMode.HTML
-                        )
-                    
-                    # Помечаем как отправленное (даже если пар нет, чтобы не проверять каждую секунду)
-                    user_store[uid_str]["last_sent_date"] = today_iso
-                    save_users(user_store)
+                # Уже отправляли сегодня?
+                if info.get("last_sent_date") == today_iso:
+                    logger.info(f"⏭️ Пользователь {uid_str}: уже отправлено сегодня")
+                    continue
+
+                uid_int = int(uid_str)
+
+                # Группа выбрана?
+                if uid_int not in selected_group_per_chat:
+                    logger.warning(f"⚠️ Пользователь {uid_int}: группа не выбрана")
+                    continue
+
+                logger.info(f"📨 Рассылка для {uid_int} (@{info.get('username')}) в {now_str}")
+
+                wk = await get_current_wk()
+                url = build_url_for_wk(wk, uid_int)
+
+                async with _shared_session.get(url, timeout=15) as resp:
+                    html = await resp.text()
+
+                week_text = parse_schedule_pretty(html)
+                today_text = extract_today(week_text)
+                group = selected_group_per_chat.get(uid_int, "не выбрана")
+
+                msg_text = (
+                    f"👤 <b>Ваша группа:</b> {group}\n"
+                    f"🔔 <b>Расписание на сегодня ({now_str})</b>\n\n"
+                    f"{today_text}"
+                )
+
+                await bot.send_message(
+                    uid_int,
+                    msg_text,
+                    parse_mode=ParseMode.HTML
+                )
+                sent_count += 1
+                logger.info(f"✅ Отправлено пользователю {uid_int}")
+
+                # Помечаем как отправленное
+                user_store[uid_str]["last_sent_date"] = today_iso
+                save_users(user_store)
+
+            logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count} сообщений")
 
         except Exception as e:
-            logging.error(f"Ошибка в цикле рассылки: {e}")
+            logger.error(f"❌ Критическая ошибка в цикле рассылки: {type(e).__name__}: {e}", exc_info=True)
 
         # Спим до начала следующей минуты
         await asyncio.sleep(60 - datetime.datetime.now().second)
@@ -571,7 +579,6 @@ def _clean_old_cache():
     max_age_seconds = MAX_CACHE_AGE_DAYS * 24 * 3600
 
     initial_size = len(_cache)
-    # Фильтруем словарь: оставляем только свежие записи
     _cache = {
         url: data for url, data in _cache.items()
         if (now - data[0]) < max_age_seconds
@@ -588,23 +595,24 @@ def _load_cache_file():
             data = pickle.load(f)
             if isinstance(data, dict):
                 _cache.update(data)
-                logger.info("Loaded cache file with %d entries", len(data))
+                logger.info("✅ Загружен кэш из файла: %d записей", len(data))
     except Exception as e:
-        logger.warning("Failed to load cache file: %s", e)
+        logger.warning("❌ Не удалось загрузить кэш-файл: %s", e)
 
 def _save_cache_file():
     try:
-        _clean_old_cache()  # Чистим перед сохранением
+        _clean_old_cache()
 
         with open(CACHE_FILE + ".tmp", "wb") as f:
             pickle.dump(_cache, f)
         os.replace(CACHE_FILE + ".tmp", CACHE_FILE)
-        logger.info("Saved cache file (%d entries)", len(_cache))
+        logger.info("💾 Кэш сохранён в файл (%d записей)", len(_cache))
     except Exception as e:
-        logger.warning("Failed to save cache file: %s", e)
+        logger.warning("❌ Не удалось сохранить кэш-файл: %s", e)
 
-# попытка загрузки кеша при старте
-_load_cache_file()
+# === ВЫЗОВ ПРИ СТАРТЕ (было обрезано) ===
+_load_cache_file()          # ← вот это было потеряно
+logger.info("🗄️ Кэш страниц инициализирован (загружено %d записей)", len(_cache))
 
 # ----------------- АВТООПРЕДЕЛЕНИЕ НЕДЕЛИ -----------------
 async def get_current_wk() -> int:
@@ -1268,6 +1276,28 @@ async def debug_week(message: Message):
     # Принудительно обновляем кеш прямо сейчас для теста
     CURRENT_WK_CACHE["ts"] = 0  # сбрасываем ts → следующее нажатие кнопки или рассылка обновит
     await message.answer("🔄 Кеш недели сброшен! Теперь нажми кнопку «🔁 обновить» или дождись рассылки — увидишь новую неделю сразу.")
+
+@dp.message(Command("clear_sent"))
+async def clear_sent_dates(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        await message.answer("⛔ Только владелец может использовать эту команду")
+        return
+
+    count = 0
+    for uid_str, info in user_store.items():
+        if "last_sent_date" in info:
+            del info["last_sent_date"]
+            count += 1
+
+    save_users(user_store)  # атомарное сохранение как везде в твоём коде
+
+    await message.answer(
+        f"✅ <b>last_sent_date очищен у {count} пользователей!</b>\n\n"
+        f"Теперь рассылка сработает сегодня (даже если время уже прошло).\n"
+        f"Можешь сразу проверить командой /stats",
+        parse_mode=ParseMode.HTML
+    )
+    logger.info(f"🧹 Владелец очистил last_sent_date у {count} пользователей")
 
 @dp.message(lambda message: message.chat.id in waiting_for_schedule_time)
 async def schedule_input(message: Message):
