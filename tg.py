@@ -152,6 +152,10 @@ selected_course_per_chat: dict[int, str] = {}
 selected_group_per_chat: dict[int, str] = {}
 
 waiting_for_schedule_time: set[int] = set()
+waiting_for_broadcast: set[int] = set()
+waiting_for_supp_id: set[int] = set()
+admin_panel_msg_id: dict[int, int] = {}
+
 last_sent_today: dict[int, str] = {}
 
 # Global aiohttp session (new)
@@ -274,12 +278,77 @@ def build_url_for_wk(wk: int | None, chat_id: int) -> str:
     return f"{base}&wk={wk}"
 
 def get_current_monday_ts() -> float:
-    """Возвращает timestamp понедельника 00:00 текущей недели"""
     now = datetime.datetime.now()
     days_to_monday = now.weekday()          # 0 = понедельник
     monday = now - datetime.timedelta(days=days_to_monday)
     monday_midnight = monday.replace(hour=0, minute=0, second=0, microsecond=0)
     return monday_midnight.timestamp()
+
+def get_stats_text() -> str:
+    uptime_seconds = int(time.time() - START_TIME)
+    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
+    cache_size = len(_cache)
+    total_users = len(user_store)
+    if selected_group_per_chat:
+        most_popular_group, group_count = Counter(selected_group_per_chat.values()).most_common(1)[0]
+    else:
+        most_popular_group, group_count = "Нет данных", 0
+    total_reqs = TOTAL_REQUESTS
+    last_user_name = "Нет данных"
+    last_time = 0
+    for uid_str, info in user_store.items():
+        if int(uid_str) == BOT_OWNER_ID:
+            continue
+        user_time = info.get("last_activity", 0)
+        if user_time > last_time:
+            last_time = user_time
+            last_user_name = info.get("username", "без_ника")
+    last_use_text = f"@{last_user_name} ({datetime.datetime.fromtimestamp(last_time).strftime('%d.%m.%Y %H:%M:%S')})" if last_time > 0 else "Никто еще не пользовался"
+    active_schedules = sum(1 for info in user_store.values() if "schedule_time" in info)
+    today_iso = datetime.date.today().isoformat()
+    today_sent = sum(1 for info in user_store.values() if info.get("last_sent_date") == today_iso)
+    last_sent_info = None
+    for uid_str, info in user_store.items():
+        if info.get("last_sent_date") == today_iso and "last_sent_time" in info:
+            if last_sent_info is None or info["last_sent_time"] > last_sent_info[1]:
+                last_sent_info = (info.get("username", "без ника"), info["last_sent_time"], uid_str)
+    last_sent_text = f"@{last_sent_info[0]} в {last_sent_info[1]}" if last_sent_info else "Сегодня ещё не было"
+    return (
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"⏱ <b>Время работы:</b> {uptime_str}\n"
+        f"📦 <b>Размер кеша:</b> {cache_size} стр.\n"
+        f"👥 <b>Всего юзеров:</b> {total_users}\n"
+        f"🏆 <b>Популярная группа:</b> {most_popular_group} ({group_count} чел.)\n"
+        f"📈 <b>Всего запросов:</b> {total_reqs}\n"
+        f"👤 <b>Последний активный:</b> {last_use_text}\n"
+        f"🔔 <b>Подключено рассылок:</b> {active_schedules}\n"
+        f"📨 <b>Рассылок отправлено сегодня:</b> {today_sent}\n"
+        f"⏰ <b>Последняя рассылка:</b> {last_sent_text}\n"
+    )
+
+
+def get_users_list_text() -> str:
+    if not user_store:
+        return "Пользователи ещё не зарегистрированы"
+    lines = []
+    for uid, info in sorted(user_store.items(), key=lambda x: int(x[0])):
+        ts = info.get("last_activity", 0)
+        last_seen = f" (последняя активность: {datetime.datetime.fromtimestamp(ts).strftime('%d.%m.%Y %H:%M:%S')})" if ts > 0 else " (активность неизвестна)"
+        lines.append(f"{uid} — @{info.get('username', 'без ника')}{last_seen}")
+    return "📋 Сохранённые пользователи:\n\n" + "\n".join(lines)
+
+
+def get_schedule_list_text() -> str:
+    lines = []
+    for uid_str, info in sorted(user_store.items(), key=lambda x: x[1].get("schedule_time", "99:99")):
+        if "schedule_time" in info:
+            username = info.get("username", "без ника")
+            group = selected_group_per_chat.get(int(uid_str), "не выбрана")
+            time_ = info["schedule_time"]
+            lines.append(f"• {uid_str} — @{username} → <b>{time_}</b> (группа: {group})")
+    if lines:
+        return f"🔔 <b>Активные рассылки ({len(lines)}):</b>\n\n" + "\n".join(lines)
+    return "📭 Нет подключённых рассылок"
 # ----------------- INLINE KEYBOARDS -----------------
 def make_inline_kb():
     return InlineKeyboardMarkup(
@@ -307,6 +376,19 @@ def build_schedule_kb():
                 InlineKeyboardButton(text="🔙 Назад", callback_data="schedule_back"),
                 InlineKeyboardButton(text="❌ Отменить рассылку", callback_data="schedule_disable")
             ]
+        ]
+    )
+
+def build_admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+            [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
+            [InlineKeyboardButton(text="🔔 Рассылки", callback_data="admin_schedules")],
+            [InlineKeyboardButton(text="📢 Оповещение", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🛠 Саппорт мод", callback_data="admin_supp")],
+            [InlineKeyboardButton(text="🧹 Очистить last sent", callback_data="admin_clear_sent")],
+            [InlineKeyboardButton(text="🔍 Debug недели", callback_data="admin_debug_week")],
         ]
     )
 
@@ -1150,40 +1232,15 @@ async def show_stats(message: Message):
     else:
         last_sent_text = "Сегодня ещё не было"
 
-    text = (
-        f"📊 <b>Статистика бота</b>\n\n"
-        f"⏱ <b>Время работы:</b> {uptime_str}\n"
-        f"📦 <b>Размер кеша:</b> {cache_size} стр.\n"
-        f"👥 <b>Всего юзеров:</b> {total_users}\n"
-        f"🏆 <b>Популярная группа:</b> {most_popular_group} ({group_count} чел.)\n"
-        f"📈 <b>Всего запросов:</b> {total_reqs}\n"
-        f"👤 <b>Последний активный:</b> {last_use_text}\n"
-        f"🔔 <b>Подключено рассылок:</b> {active_schedules}\n"
-        f"📨 <b>Рассылок отправлено сегодня:</b> {today_sent}\n"
-        f"⏰ <b>Последняя рассылка:</b> {last_sent_text}\n"
-    )
-    
+    text = get_stats_text()
+
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(Command("list_users"))
 async def list_users(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
         return
-    if not user_store:
-        await message.answer("Пользователи ещё не зарегистрированы")
-        return
-
-    lines = []
-    for uid, info in sorted(user_store.items(), key=lambda x: int(x[0])):
-        ts = info.get("last_activity", 0)
-        if ts > 0:
-            dt = datetime.datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M:%S")
-            last_seen = f" (последняя активность: {dt})"
-        else:
-            last_seen = " (активность неизвестна)"
-        lines.append(f"{uid} — @{info.get('username', 'без ника')}{last_seen}")
-
-    await message.answer("📋 Сохранённые пользователи:\n\n" + "\n".join(lines))
+    await message.answer(get_users_list_text())
 
 @dp.message(Command("schedule_list"))
 async def schedule_list(message: Message):
@@ -1198,13 +1255,11 @@ async def schedule_list(message: Message):
             time = info["schedule_time"]
             lines.append(f"• {uid_str} — @{username} → <b>{time}</b> (группа: {group})")
 
-    if lines:
-        await message.answer(
-            f"🔔 <b>Активные рассылки ({len(lines)}):</b>\n\n" + "\n".join(lines),
-            parse_mode=ParseMode.HTML
-        )
+    text = get_schedule_list_text()
+    if "<b>" in text:  # активные рассылки
+        await message.answer(text, parse_mode=ParseMode.HTML)
     else:
-        await message.answer("📭 Нет подключённых рассылок")
+        await message.answer(text)
 
 # словарь: user_id -> target_id (кому пересылать)
 active_supp: dict[int, int] = {}
@@ -1344,6 +1399,135 @@ async def clear_sent_dates(message: Message):
         parse_mode=ParseMode.HTML
     )
     logger.info(f"🧹 Владелец очистил last_sent_date у {count} пользователей")
+
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        return
+    text = "Добро пожаловать в админ-панель"
+    msg = await message.answer(text, reply_markup=build_admin_kb())
+    admin_panel_msg_id[message.from_user.id] = msg.message_id
+
+
+@dp.callback_query(F.data.startswith("admin_"))
+async def admin_panel_callback(cb: CallbackQuery):
+    await cb.answer()
+    if cb.from_user.id != BOT_OWNER_ID:
+        return
+    chat_id = cb.message.chat.id
+    action = cb.data[6:]
+    panel_id = admin_panel_msg_id.get(cb.from_user.id)
+    if not panel_id:
+        await cb.message.answer("Панель не найдена. Вызови /admin")
+        return
+
+    if action == "stats":
+        text = get_stats_text()
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
+                                    parse_mode=ParseMode.HTML, reply_markup=build_admin_kb())
+
+    elif action == "users":
+        text = get_users_list_text()
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
+                                    reply_markup=build_admin_kb())
+
+    elif action == "schedules":
+        text = get_schedule_list_text()
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
+                                    parse_mode=ParseMode.HTML if "<b>" in text else None,
+                                    reply_markup=build_admin_kb())
+
+    elif action == "broadcast":
+        waiting_for_broadcast.add(chat_id)
+        await bot.edit_message_text(
+            "Напишите сообщение для массового оповещения, либо напишите отмена.",
+            chat_id=chat_id, message_id=panel_id
+        )
+
+    elif action == "supp":
+        lines = [f"{uid} — @{info.get('username', 'без ника')}" for uid, info in
+                 sorted(user_store.items(), key=lambda x: int(x[0]))]
+        text = "📋 Список пользователей:\n\n" + "\n".join(lines) + "\n\nУкажите ID для связи (или отмена)"
+        waiting_for_supp_id.add(chat_id)
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id)
+
+    elif action == "clear_sent":
+        count = 0
+        for uid_str, info in user_store.items():
+            if "last_sent_date" in info:
+                del info["last_sent_date"]
+                count += 1
+        save_users(user_store)
+        text = f"✅ <b>last_sent_date очищен у {count} пользователей!</b>\n\nТеперь рассылка сработает сегодня."
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
+                                    parse_mode=ParseMode.HTML, reply_markup=build_admin_kb())
+        logger.info(f"🧹 Админ очистил last_sent_date у {count} пользователей")
+
+    elif action == "debug_week":
+        monday_ts = get_current_monday_ts()
+        current_wk = await get_current_wk()
+        text = (
+            f"🔍 <b>Отладка автоопределения недели</b>\n\n"
+            f"📅 Сегодня: <b>{datetime.datetime.now().strftime('%A %d.%m.%Y %H:%M')}</b>\n\n"
+            f"Понедельник этой недели (00:00): <b>{datetime.datetime.fromtimestamp(monday_ts).strftime('%d.%m.%Y %H:%M')}</b>\n"
+            f"monday_ts = <code>{monday_ts}</code>\n\n"
+            f"CURRENT_WK_CACHE:\n   wk = <b>{CURRENT_WK_CACHE['wk']}</b>\n   ts = <code>{CURRENT_WK_CACHE['ts']}</code>\n\n"
+            f"✅ Определённая неделя: <b>{current_wk}</b>"
+        )
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=panel_id,
+                                    parse_mode=ParseMode.HTML, reply_markup=build_admin_kb())
+        CURRENT_WK_CACHE["ts"] = 0
+        logger.info("🔄 Кеш недели сброшен через админ-панель")
+
+
+@dp.message(lambda m: m.from_user.id == BOT_OWNER_ID and m.chat.id in waiting_for_broadcast)
+async def handle_broadcast_input(message: Message):
+    chat_id = message.chat.id
+    if message.text and message.text.strip().lower() in ["отмена", "отменить"]:
+        waiting_for_broadcast.discard(chat_id)
+        await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
+                                    message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
+        await message.answer("Отменено.")
+        return
+
+    sent = failed = 0
+    for uid in user_store:
+        try:
+            await bot.copy_message(chat_id=int(uid), from_chat_id=message.chat.id, message_id=message.message_id)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except:
+            failed += 1
+    waiting_for_broadcast.discard(chat_id)
+    await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
+                                message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
+    await message.answer(f"📢 Рассылка завершена\nОтправлено: {sent}\nОшибок: {failed}")
+
+
+@dp.message(lambda m: m.from_user.id == BOT_OWNER_ID and m.chat.id in waiting_for_supp_id)
+async def handle_supp_id_input(message: Message):
+    chat_id = message.chat.id
+    text = message.text.strip().lower()
+    if text in ["отмена", "отменить"]:
+        waiting_for_supp_id.discard(chat_id)
+        await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
+                                    message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
+        await message.answer("Отменено.")
+        return
+    try:
+        target_id = int(text)
+    except:
+        await message.answer("Неверный ID, попробуйте снова или отмена.")
+        return
+    target_str = str(target_id)
+    if target_str not in user_store:
+        await message.answer("Такого пользователя нет.")
+        return
+    active_supp[message.from_user.id] = target_id
+    waiting_for_supp_id.discard(chat_id)
+    await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
+                                message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
+    await message.answer(f"🎯 Переписка с → {target_id} активирована (/supp_stop для остановки)")
 
 @dp.message(lambda message: message.chat.id in waiting_for_schedule_time)
 async def schedule_input(message: Message):
