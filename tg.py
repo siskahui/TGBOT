@@ -56,7 +56,6 @@ def is_flood(user_id: int) -> bool:
     callback_cooldown[user_id] = now
     return False
 
-
 class CallbackAntiFloodMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if hasattr(event, "from_user"):
@@ -67,7 +66,13 @@ class CallbackAntiFloodMiddleware(BaseMiddleware):
                     await event.answer("Лелеле тише ковбой")
                 return
 
-        return await handler(event, data)
+        try:
+            return await handler(event, data)
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e).lower() or "response timeout expired" in str(e).lower():
+                logger.warning(f"⚠️ Старый callback от юзера {user_id} (игнорируем)")
+                return
+            raise
 
 def is_user_spamming(user_id: int) -> bool:
     now = time.time()
@@ -484,25 +489,25 @@ async def schedule_sender():
             now_str = now_dt.strftime("%H:%M")
             today_iso = datetime.date.today().isoformat()
 
-            logger.info(f"🔄 Рассылка: проверка в {now_str} (сегодня {today_iso})")
+            # Проверяем, есть ли вообще кому рассылать сегодня
+            active_users = [uid for uid, info in user_store.items() if info.get("schedule_time") == now_str]
+            has_active_today = bool(active_users)
+
+            if has_active_today:
+                logger.info(f"🔄 Рассылка: проверка в {now_str} (активных: {len(active_users)})")
 
             sent_count = 0
             for uid_str, info in list(user_store.items()):
                 target_time = info.get("schedule_time")
-                if not target_time:
+                if not target_time or target_time != now_str:
                     continue
 
-                if target_time != now_str:
-                    continue
-
-                # Уже отправляли сегодня?
                 if info.get("last_sent_date") == today_iso:
                     logger.info(f"⏭️ Пользователь {uid_str}: уже отправлено сегодня")
                     continue
 
                 uid_int = int(uid_str)
 
-                # Группа выбрана?
                 if uid_int not in selected_group_per_chat:
                     logger.warning(f"⚠️ Пользователь {uid_int}: группа не выбрана")
                     continue
@@ -525,19 +530,29 @@ async def schedule_sender():
                     f"{today_text}"
                 )
 
-                await bot.send_message(
-                    uid_int,
-                    msg_text,
-                    parse_mode=ParseMode.HTML
-                )
-                sent_count += 1
-                logger.info(f"✅ Отправлено пользователю {uid_int}")
+                try:
+                    sent_msg = await bot.send_message(
+                        uid_int,
+                        msg_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=make_inline_kb()
+                    )
+                    last_msg_per_chat[uid_int] = sent_msg.message_id
+                    last_text_per_chat[uid_int] = msg_text
 
-                # Помечаем как отправленное
+                    sent_count += 1
+                    logger.info(f"✅ Отправлено пользователю {uid_int} (с клавиатурой)")
+
+                    user_store[uid_str]["last_sent_time"] = now_str
+                except Exception as send_err:
+                    logger.error(f"❌ Не удалось отправить рассылку {uid_int}: {send_err}")
+                    continue
+
                 user_store[uid_str]["last_sent_date"] = today_iso
                 save_users(user_store)
 
-            logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count} сообщений")
+            if sent_count > 0 or has_active_today:
+                logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count} сообщений")
 
         except Exception as e:
             logger.error(f"❌ Критическая ошибка в цикле рассылки: {type(e).__name__}: {e}", exc_info=True)
@@ -1085,17 +1100,17 @@ async def show_stats(message: Message):
     if message.from_user.id != BOT_OWNER_ID:
         return
 
-    # 1. Время работы бота (аптайм)
+    # 1. Время работы бота
     uptime_seconds = int(time.time() - START_TIME)
     uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
 
-    # 2. Размер кеша страниц
+    # 2. Размер кеша
     cache_size = len(_cache)
 
     # 3. Всего юзеров
     total_users = len(user_store)
 
-    # 4. Наиболее популярная группа
+    # 4. Популярная группа
     if selected_group_per_chat:
         most_popular_group, group_count = Counter(selected_group_per_chat.values()).most_common(1)[0]
     else:
@@ -1104,29 +1119,37 @@ async def show_stats(message: Message):
     # 5. Всего запросов
     total_reqs = TOTAL_REQUESTS
 
-    # 6. Последнее использование (исключая владельца)
+    # 6. Последний активный (исключая владельца)
     last_user_name = "Нет данных"
     last_time = 0
-    
     for uid_str, info in user_store.items():
         if int(uid_str) == BOT_OWNER_ID:
             continue
-            
         user_time = info.get("last_activity", 0)
         if user_time > last_time:
             last_time = user_time
             last_user_name = info.get("username", "без_ника")
+    last_use_text = f"@{last_user_name} ({datetime.datetime.fromtimestamp(last_time).strftime('%d.%m.%Y %H:%M:%S')})" if last_time > 0 else "Никто еще не пользовался"
 
-    if last_time > 0:
-        last_time_str = datetime.datetime.fromtimestamp(last_time).strftime('%d.%m.%Y %H:%M:%S')
-        last_use_text = f"@{last_user_name} ({last_time_str})"
-    else:
-        last_use_text = "Никто еще не пользовался"
-
-    # 7. Количество подключенных рассылок
+    # 7. Активные рассылки
     active_schedules = sum(1 for info in user_store.values() if "schedule_time" in info)
 
-    # Формируем итоговое сообщение
+    # === НОВОЕ ===
+    today_iso = datetime.date.today().isoformat()
+    today_sent = sum(1 for info in user_store.values() if info.get("last_sent_date") == today_iso)
+
+    # Последняя рассылка сегодня
+    last_sent_info = None
+    for uid_str, info in user_store.items():
+        if info.get("last_sent_date") == today_iso and "last_sent_time" in info:
+            if last_sent_info is None or info["last_sent_time"] > last_sent_info[1]:
+                last_sent_info = (info.get("username", "без ника"), info["last_sent_time"], uid_str)
+
+    if last_sent_info:
+        last_sent_text = f"@{last_sent_info[0]} в {last_sent_info[1]}"
+    else:
+        last_sent_text = "Сегодня ещё не было"
+
     text = (
         f"📊 <b>Статистика бота</b>\n\n"
         f"⏱ <b>Время работы:</b> {uptime_str}\n"
@@ -1136,6 +1159,8 @@ async def show_stats(message: Message):
         f"📈 <b>Всего запросов:</b> {total_reqs}\n"
         f"👤 <b>Последний активный:</b> {last_use_text}\n"
         f"🔔 <b>Подключено рассылок:</b> {active_schedules}\n"
+        f"📨 <b>Рассылок отправлено сегодня:</b> {today_sent}\n"
+        f"⏰ <b>Последняя рассылка:</b> {last_sent_text}\n"
     )
     
     await message.answer(text, parse_mode=ParseMode.HTML)
@@ -1159,6 +1184,27 @@ async def list_users(message: Message):
         lines.append(f"{uid} — @{info.get('username', 'без ника')}{last_seen}")
 
     await message.answer("📋 Сохранённые пользователи:\n\n" + "\n".join(lines))
+
+@dp.message(Command("schedule_list"))
+async def schedule_list(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        return
+
+    lines = []
+    for uid_str, info in sorted(user_store.items(), key=lambda x: x[1].get("schedule_time", "99:99")):
+        if "schedule_time" in info:
+            username = info.get("username", "без ника")
+            group = selected_group_per_chat.get(int(uid_str), "не выбрана")
+            time = info["schedule_time"]
+            lines.append(f"• {uid_str} — @{username} → <b>{time}</b> (группа: {group})")
+
+    if lines:
+        await message.answer(
+            f"🔔 <b>Активные рассылки ({len(lines)}):</b>\n\n" + "\n".join(lines),
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await message.answer("📭 Нет подключённых рассылок")
 
 # словарь: user_id -> target_id (кому пересылать)
 active_supp: dict[int, int] = {}
