@@ -1,5 +1,8 @@
 # ТГ БОТ КС ПГУТИ РАСПИСАНИЕ
 
+## 📄 Changelog
+
+- [Changelog](./CHANGELOG.md)
 
 ## env.example
 RELEASE_TOKEN=Токен созданного тг бота через @botfather  
