@@ -604,14 +604,21 @@ async def schedule_sender():
             now_str = now_dt.strftime("%H:%M")
             today_iso = datetime.date.today().isoformat()
 
-            active_users = [uid for uid, info in user_store.items() if info.get("schedule_time") == now_str]
-            if active_users:
-                logger.info(f"🔄 Рассылка: {len(active_users)} активных в {now_str}")
+            # === Кто сейчас должен получить рассылку ===
+            active_users = [
+                uid for uid, info in user_store.items()
+                if info.get("schedule_time") == now_str
+            ]
+
+            if not active_users:
+                await asyncio.sleep(60 - now_dt.second)
+                continue
+
+            logger.info(f"🔄 Рассылка: {len(active_users)} активных в {now_str}")
 
             wk = await get_current_wk()
-            sent_count = 0
 
-            # === ГРУППИРОВКА: один fetch + parse на группу ===
+            # === Группируем по URL (один fetch на группу) ===
             url_to_uids: dict[str, list[str]] = defaultdict(list)
             for uid_str in active_users:
                 uid_int = int(uid_str)
@@ -622,17 +629,36 @@ async def schedule_sender():
                 url = f"https://lk.ks.psuti.ru/?mn=2&obj={obj}&wk={wk}"
                 url_to_uids[url].append(uid_str)
 
+            sent_count = 0
+            sent_this_run = set()  # защита от двойного счёта
+
             for url, uid_list in url_to_uids.items():
+                # Убираем возможные дубли (на всякий случай)
+                unique_uids = list(dict.fromkeys(uid_list))  # сохраняет порядок
+
                 async with _shared_session.get(url, timeout=15) as resp:
                     html = await resp.text()
+
+                # Парсим один раз на группу
                 week_text = parse_schedule_pretty(html)
                 today_text = extract_today(week_text)
 
-                for uid_str in uid_list:
+                # Пропускаем всю группу, если нет занятий
+                lower_text = today_text.lower()
+                if "занятий нет" in lower_text or "день не найден" in lower_text or "сегодня занятий нет" in lower_text:
+                    logger.info(f"⏭️ Пропуск группы ({len(unique_uids)} чел.) — нет занятий сегодня")
+                    continue
+
+                logger.info(f"📨 Отправляем группе ({len(unique_uids)} чел.): {url}")
+
+                for uid_str in unique_uids:
                     uid_int = int(uid_str)
-                    info = user_store[uid_str]
-                    if info.get("last_sent_date") == today_iso:
+                    info = user_store.get(uid_str)
+                    if not info or info.get("last_sent_date") == today_iso:
                         continue
+
+                    if uid_int in sent_this_run:
+                        continue  # защита от двойной отправки
 
                     group_name = selected_group_per_chat.get(uid_int, "не выбрана")
                     msg_text = (
@@ -649,20 +675,26 @@ async def schedule_sender():
                         )
                         last_msg_per_chat[uid_int] = sent_msg.message_id
                         last_text_per_chat[uid_int] = msg_text
-                        sent_count += 1
 
+                        sent_count += 1
+                        sent_this_run.add(uid_int)
                         info["last_sent_time"] = now_str
                         info["last_sent_date"] = today_iso
+
+                        logger.debug(f"✅ Отправлено {uid_int} (sent_count = {sent_count})")
+
                     except Exception as e:
                         logger.error(f"❌ Рассылка {uid_int}: {e}")
 
+            # Сохраняем только если что-то отправили
             if sent_count > 0:
                 save_users(user_store)
                 logger.info(f"📊 Рассылка завершена. Отправлено: {sent_count}")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка рассылки: {type(e).__name__}: {e}", exc_info=True)
+            logger.error(f"❌ Критическая ошибка в schedule_sender: {type(e).__name__}: {e}", exc_info=True)
 
+        # Ждём ровно до следующей минуты
         await asyncio.sleep(60 - datetime.datetime.now().second)
 
 # ----------------- FETCH (basic) -----------------
