@@ -29,6 +29,8 @@ BOT_OWNER_ID = int(os.getenv("OWNERID")) #ID ТГ Аккаунта
 USER_FILE = "users.json" #Куда сохраняются пользователи
 GROUPS_FILE = "groups.json" #Где хранится список групп + курсы
 SELECTION_FILE = "selections.json" #Закешированный выбор юзеров
+SETTINGS_FILE = "settings.json"
+GLOBAL_BROADTASK = ""
 CURRENT_WK_CACHE: dict = {"wk": 323, "ts": 0.0}
 callback_cooldown = {}
 CALLBACK_DELAY = 1.0  # Настройка антифлуда на кнопки
@@ -155,6 +157,7 @@ selected_group_per_chat: dict[int, str] = {}
 waiting_for_schedule_time: set[int] = set()
 waiting_for_broadcast: set[int] = set()
 waiting_for_supp_id: set[int] = set()
+waiting_for_broadtask: set[int] = set()
 admin_panel_msg_id: dict[int, int] = {}
 
 last_sent_today: dict[int, str] = {}
@@ -173,6 +176,16 @@ def load_json_file(path: str) -> dict:
 def save_json_file(path: str, data: dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_settings():
+    global GLOBAL_BROADTASK
+    data = load_json_file(SETTINGS_FILE)
+    GLOBAL_BROADTASK = data.get("broadtask", "")
+
+def save_settings():
+    save_json_file(SETTINGS_FILE, {"broadtask": GLOBAL_BROADTASK})
+
+load_settings()
 
 def load_users():
     """Загружает всех пользователей из файла целиком"""
@@ -382,6 +395,12 @@ def get_schedule_list_text() -> str:
     if lines:
         return f"🔔 <b>Активные рассылки ({len(lines)}):</b>\n\n" + "\n".join(lines)
     return "📭 Нет подключённых рассылок"
+
+def apply_broadtask(text: str) -> str:
+    if GLOBAL_BROADTASK:
+        # Добавляем разделитель и сообщение от админа
+        return f"{text}\n\n<b>📢 Сообщение от Админа:</b>\n<i>{GLOBAL_BROADTASK}</i>"
+    return text
 # ----------------- INLINE KEYBOARDS -----------------
 def make_inline_kb():
     return InlineKeyboardMarkup(
@@ -419,6 +438,7 @@ def build_admin_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
             [InlineKeyboardButton(text="🔔 Рассылки", callback_data="admin_schedules")],
             [InlineKeyboardButton(text="📢 Оповещение", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="📝 Текст в сообщения (Broadtask)", callback_data="admin_bt_setup")],
             [InlineKeyboardButton(text="🛠 Саппорт мод", callback_data="admin_supp")],
             [InlineKeyboardButton(text="🧹 Очистить last sent", callback_data="admin_clear_sent")],
             [InlineKeyboardButton(text="🔍 Debug недели", callback_data="admin_debug_week")],
@@ -666,6 +686,7 @@ async def schedule_sender():
                         f"🔔 <b>Расписание на сегодня ({now_str})</b>\n\n"
                         f"{today_text}"
                     )
+                    msg_text = apply_broadtask(msg_text)
 
                     try:
                         sent_msg = await bot.send_message(
@@ -847,6 +868,7 @@ async def get_cached_page(session, url):
 
 # ----------------- SEND MESSAGE / EDIT -----------------
 async def send_or_edit_text(text: str, chat_id: int):
+    text = apply_broadtask(text)
     if not text or not text.strip():
         text = "⚠️ Расписание не загрузилось. Нажмите «🔁 обновить»"
 
@@ -939,9 +961,10 @@ async def start(message: Message):
     last_msg_per_chat.pop(chat_id, None)
     last_text_per_chat.pop(chat_id, None)
 
+    welcome_text = apply_broadtask("ТГ БОТ РАСПИСАНИЕ ПГУТИ\n\nhttps://github.com/Sp0nge-bob/TGBOT")
     await bot.send_message(
         chat_id,
-        "ТГ БОТ РАСПИСАНИЕ ПГУТИ\n\nhttps://github.com/Sp0nge-bob/TGBOT",
+        welcome_text,
         parse_mode=ParseMode.HTML,
         reply_markup=make_inline_kb()
     )
@@ -1499,6 +1522,15 @@ async def admin_panel_callback(cb: CallbackQuery):
             chat_id=chat_id, message_id=panel_id
         )
 
+    elif action == "bt_setup":
+        waiting_for_broadtask.add(chat_id)
+        current_status = f"\n\n<b>Текущий текст:</b>\n<i>{GLOBAL_BROADTASK}</i>" if GLOBAL_BROADTASK else "\n\n(Сейчас пусто)"
+        await bot.edit_message_text(
+            f"Введите текст, который будет автоматически добавляться в конец КАЖДОГО сообщения бота.{current_status}\n\n"
+            f"Отправьте <b>clear</b>, чтобы удалить текст, или <b>отмена</b>.",
+            chat_id=chat_id, message_id=panel_id, parse_mode=ParseMode.HTML
+        )
+
     elif action == "supp":
         lines = [f"{uid} — @{info.get('username', 'без ника')}" for uid, info in
                  sorted(user_store.items(), key=lambda x: int(x[0]))]
@@ -1629,6 +1661,64 @@ async def schedule_input(message: Message):
     except ValueError:
         await message.answer("⚠️ Неверный формат. Пожалуйста, введите время как <b>08:30</b> или напишите 'Отмена'.", parse_mode=ParseMode.HTML)
 
+@dp.message(Command("broadtask"))
+async def set_broadtask(message: Message):
+    if message.from_user.id != BOT_OWNER_ID:
+        return
+
+    global GLOBAL_BROADTASK
+    # Убираем команду из текста
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) < 2:
+        await message.answer("⚠️ Использование:\n`/broadtask Текст` — установить\n`/broadtask clear` — удалить", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    payload = args[1].strip()
+
+    if payload.lower() == "clear":
+        GLOBAL_BROADTASK = ""
+        save_settings()
+        await message.answer("✅ Оповещение полностью удалено.")
+    else:
+        GLOBAL_BROADTASK = payload
+        save_settings()
+        await message.answer(f"✅ Новое оповещение установлено:\n\n{GLOBAL_BROADTASK}")
+
+@dp.message(lambda m: m.from_user.id == BOT_OWNER_ID and m.chat.id in waiting_for_broadtask)
+async def handle_bt_input(message: Message):
+    chat_id = message.chat.id
+    global GLOBAL_BROADTASK
+    
+    # Сбрасываем состояние ожидания сразу
+    waiting_for_broadtask.discard(chat_id)
+    
+    # Если нажали отмену
+    if message.text and message.text.strip().lower() in ["отмена", "отменить"]:
+        await message.answer("Изменение текста отменено.")
+        # Возвращаем панель в исходное состояние
+        await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
+                                    message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
+        return
+
+    # Логика сохранения или очистки
+    input_text = message.text.strip() if message.text else ""
+    
+    if input_text.lower() == "clear":
+        GLOBAL_BROADTASK = ""
+        confirm_msg = "✅ Дополнительный текст удален."
+    else:
+        GLOBAL_BROADTASK = input_text
+        confirm_msg = f"✅ Текст успешно установлен:\n\n{GLOBAL_BROADTASK}"
+
+    # Сохраняем в файл, чтобы не пропало после перезагрузки
+    save_settings()
+    
+    # Возвращаем админ-панель
+    await bot.edit_message_text("Добро пожаловать в админ-панель", chat_id=chat_id,
+                                message_id=admin_panel_msg_id[chat_id], reply_markup=build_admin_kb())
+    
+    await message.answer(confirm_msg)
 # ----------------- UNIVERSAL FORWARD -----------------
 @dp.message()
 async def forward_messages(message: Message):
