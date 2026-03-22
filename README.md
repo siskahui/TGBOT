@@ -26,7 +26,8 @@
 
 Создай `.env` файл на основе `.env.example`:
 
-~~env
+~~
+nano .env
 RELEASE_TOKEN=токен бота (через @botfather)
 OWNERID=твой Telegram ID (для админ-команд)
 ~~
@@ -37,7 +38,8 @@ OWNERID=твой Telegram ID (для админ-команд)
 
 ### 🐳 Docker (рекомендуется)
 
-~~bash
+~~
+bash
 git clone https://github.com/Sp0nge-bob/TGBOT
 cd TGBOT
 
@@ -51,7 +53,8 @@ docker compose up -d --build
 
 ### 🐍 Python
 
-~~bash
+~~
+bash
 git clone https://github.com/Sp0nge-bob/TGBOT
 cd TGBOT
 
